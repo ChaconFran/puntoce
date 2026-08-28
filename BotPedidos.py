@@ -167,7 +167,7 @@ PREMIOS_POR_NIVEL_DEFECTO = {
 
 # Pon aquí tu ID de Telegram (y el de quien más gestione premios/pedidos).
 # Para saber tu ID, escríbele a @userinfobot.
-ADMIN_IDS = {123456789}  # ← reemplaza este número por tu ID real
+ADMIN_IDS = {6797650469}
 
 def get_premios(db):
     cfg = db.setdefault("_config", {})
@@ -916,8 +916,12 @@ async def ref_ranking_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 # ─── COMANDOS DE ADMINISTRACIÓN (gestión de premios y entregas) ───
-def es_admin(user_id) -> bool:
-    return user_id in ADMIN_IDS
+def es_admin(user_id, db=None) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    if db is None:
+        db = load_db()
+    return user_id in db.get("_config", {}).get("admin_extra", [])
 
 async def cmd_setpremio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_admin(update.effective_user.id):
@@ -1092,6 +1096,208 @@ async def capturar_imagen_admin(update: Update, context: ContextTypes.DEFAULT_TY
     regalo["esperando_imagen"] = False
     save_db(db)
     await update.message.reply_text("✅ Imagen del regalo guardada.")
+
+# ─── COMANDOS DE ADMINISTRACIÓN: GESTIÓN DE ADMINS ─────────────────
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /addadmin <ID_telegram>")
+        return
+    try:
+        nuevo_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("El ID debe ser un número.")
+        return
+    db = load_db()
+    extra = db.setdefault("_config", {}).setdefault("admin_extra", [])
+    if nuevo_id in ADMIN_IDS or nuevo_id in extra:
+        await update.message.reply_text("Ese ID ya es admin.")
+        return
+    extra.append(nuevo_id)
+    save_db(db)
+    await update.message.reply_text(f"✅ {nuevo_id} añadido como admin.")
+
+async def cmd_deladmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /deladmin <ID_telegram>")
+        return
+    try:
+        id_quitar = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("El ID debe ser un número.")
+        return
+    if id_quitar in ADMIN_IDS:
+        await update.message.reply_text("Ese admin está fijado en el código (ADMIN_IDS) y no se puede quitar por comando.")
+        return
+    db = load_db()
+    extra = db.setdefault("_config", {}).setdefault("admin_extra", [])
+    if id_quitar not in extra:
+        await update.message.reply_text("Ese ID no estaba en la lista de admins añadidos por comando.")
+        return
+    extra.remove(id_quitar)
+    save_db(db)
+    await update.message.reply_text(f"✅ {id_quitar} eliminado de admins.")
+
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    extra = db.get("_config", {}).get("admin_extra", [])
+    lineas = [f"`{i}` (fijo en el código)" for i in ADMIN_IDS] + [f"`{i}` (añadido por comando)" for i in extra]
+    await update.message.reply_text("👮 *Administradores actuales:*\n\n" + "\n".join(lineas), parse_mode="Markdown")
+
+# ─── COMANDOS DE ADMINISTRACIÓN: ESTADÍSTICAS Y AVISOS ─────────────
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    n_usuarios = len(db.get("usuarios", {}))
+    pedidos = db.get("pedidos", {})
+    n_pedidos_activos = sum(1 for p in pedidos.values() if p["estado"] not in ("entregado", "cancelado"))
+    n_pedidos_total = len(pedidos)
+    compras = db.get("compras", {})
+    n_compras_confirmadas = sum(1 for c in compras.values() if c["estado"] == "confirmada")
+    ingresos_confirmados = sum(c["precio_eur"] for c in compras.values() if c["estado"] == "confirmada")
+    n_compras_pendientes = sum(1 for c in compras.values() if c["estado"] != "confirmada")
+    await update.message.reply_text(
+        f"📊 *ESTADÍSTICAS GLOBALES*\n\n"
+        f"👥 Usuarios registrados: {n_usuarios}\n"
+        f"🍔 Pedidos: {n_pedidos_activos} activos / {n_pedidos_total} totales\n"
+        f"🛍️ Compras confirmadas: {n_compras_confirmadas}\n"
+        f"💶 Ingresos confirmados: {ingresos_confirmados:.2f}€\n"
+        f"🕓 Compras pendientes de pago/verificación: {n_compras_pendientes}",
+        parse_mode="Markdown"
+    )
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    partes = update.message.text.split(" ", 1)
+    if len(partes) < 2 or not partes[1].strip():
+        await update.message.reply_text("Uso: /broadcast <mensaje>\nSe envía a todos los usuarios que hayan usado el bot.")
+        return
+    mensaje = partes[1]
+    db = load_db()
+    enviados, fallidos = 0, 0
+    for uid in db.get("usuarios", {}):
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=mensaje, parse_mode="Markdown")
+            enviados += 1
+        except Exception:
+            fallidos += 1
+    await update.message.reply_text(f"📣 Enviado a {enviados} usuarios ({fallidos} fallidos).")
+
+# ─── COMANDOS DE ADMINISTRACIÓN: PEDIDOS ────────────────────────────
+async def cmd_cancelarpedido(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Uso: /cancelarpedido <número> [motivo]")
+        return
+    numero = context.args[0]
+    motivo = " ".join(context.args[1:])
+    db = load_db()
+    pedido = db["pedidos"].get(numero)
+    if not pedido:
+        await update.message.reply_text("No encuentro ese pedido.")
+        return
+    pedido["estado"] = "cancelado"
+    save_db(db)
+    try:
+        await context.bot.send_message(
+            chat_id=pedido["usuario_id"],
+            text=f"❌ Tu pedido *#{numero}* ha sido cancelado." + (f"\nMotivo: {motivo}" if motivo else ""),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+    await update.message.reply_text(f"✅ Pedido #{numero} marcado como cancelado y cliente avisado.")
+
+# ─── COMANDOS DE ADMINISTRACIÓN: STOCK DE CC ────────────────────────
+async def cmd_addstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /addstock <clave> <id1> <id2> ...\nClaves disponibles: " + ", ".join(ROPA.keys()))
+        return
+    clave = context.args[0]
+    if clave not in ROPA:
+        await update.message.reply_text("Clave no reconocida. Claves disponibles: " + ", ".join(ROPA.keys()))
+        return
+    _nombre, _precio, stock_file = ROPA[clave]
+    nuevos_ids = context.args[1:]
+    with open(stock_file, "a", encoding="utf-8") as f:
+        for id_producto in nuevos_ids:
+            f.write(id_producto + "\n")
+    await update.message.reply_text(f"✅ Añadidos {len(nuevos_ids)} ID(s) a {clave}. Stock actual: {contar_stock(stock_file)}")
+
+async def cmd_verstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    lineas = [f"{nombre}: {contar_stock(stock_file)} unidad(es)" for _clave, (nombre, _precio, stock_file) in ROPA.items()]
+    await update.message.reply_text("📦 *Stock CC:*\n\n" + "\n".join(lineas), parse_mode="Markdown")
+
+# ─── COMANDOS DE ADMINISTRACIÓN: USUARIOS ───────────────────────────
+async def cmd_resetxp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /resetxp <ID_usuario>")
+        return
+    uid = context.args[0]
+    db = load_db()
+    if uid not in db.get("usuarios", {}):
+        await update.message.reply_text("No encuentro a ese usuario.")
+        return
+    u = get_usuario(db, uid)
+    u["xp"] = 0
+    u["claimed_levels"] = []
+    u["entregado_levels"] = []
+    save_db(db)
+    await update.message.reply_text(f"✅ XP y niveles reiniciados para el usuario {uid}.")
+
+async def cmd_adminayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    texto = """
+🛠️ *COMANDOS DE ADMIN*
+
+*Premios de niveles*
+/premios — ver premios configurados
+/setpremio <nivel> <texto> — crear/editar un premio
+/quitarpremio <nivel> — eliminar un premio
+/pendientes — premios desbloqueados sin entregar
+/entregar <ID> <nivel> — marcar premio como entregado
+
+*Regalo aleatorio*
+/verregalo — ver estado del regalo
+/setregalo <texto> — cambiar el texto
+/imagenregalo — la próxima foto que mandes será la imagen
+/quitarimagenregalo — quitar la imagen
+/setcupo <n> — activar con n unidades (reinicia reclamos)
+
+*Pedidos*
+/cola — ver pedidos activos
+/cancelarpedido <número> [motivo] — cancelar un pedido y avisar al cliente
+
+*Stock (CC)*
+/addstock <clave> <id1> <id2> ... — añadir IDs de producto
+/verstock — ver unidades restantes por producto
+
+*General*
+/stats — estadísticas globales del bot
+/broadcast <mensaje> — enviar un aviso a todos los usuarios
+/resetxp <ID_usuario> — reiniciar el nivel/XP de un usuario
+
+*Administradores*
+/admins — ver quién es admin
+/addadmin <ID> — añadir un admin
+/deladmin <ID> — quitar un admin (solo los añadidos por comando)
+"""
+    await update.message.reply_text(texto, parse_mode="Markdown")
 
 # ─── CATEGORÍA: PEDIDOS A DOMICILIO ───────────────────────────────
 async def categoria_pedidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1715,6 +1921,16 @@ def main():
     app.add_handler(CommandHandler("imagenregalo", cmd_imagenregalo))
     app.add_handler(CommandHandler("quitarimagenregalo", cmd_quitarimagenregalo))
     app.add_handler(CommandHandler("verregalo", cmd_verregalo))
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    app.add_handler(CommandHandler("deladmin", cmd_deladmin))
+    app.add_handler(CommandHandler("admins", cmd_admins))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("cancelarpedido", cmd_cancelarpedido))
+    app.add_handler(CommandHandler("addstock", cmd_addstock))
+    app.add_handler(CommandHandler("verstock", cmd_verstock))
+    app.add_handler(CommandHandler("resetxp", cmd_resetxp))
+    app.add_handler(CommandHandler("adminayuda", cmd_adminayuda))
     app.add_handler(CallbackQueryHandler(categoria_regalo, pattern="^cat_regalo$"))
     app.add_handler(CallbackQueryHandler(regalo_reclamar_callback, pattern="^regalo_reclamar$"))
     app.add_handler(MessageHandler(filters.PHOTO, capturar_imagen_admin))
