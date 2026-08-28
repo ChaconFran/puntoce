@@ -21,13 +21,20 @@ DB_FILE = os.environ.get("DB_PATH", "pedidos.json")
 logging.basicConfig(level=logging.INFO)
 
 # ─── PLATAFORMAS / RESTAURANTES DISPONIBLES ───────────────────────
-# clave interna -> (texto a mostrar, texto de la comisión que se aplica)
+# clave interna -> (texto a mostrar, precio fijo en €)
 # Edita esta lista cuando quieras añadir, quitar o cambiar precios.
 PLATAFORMAS = {
-    "telepizza":   ("Telepizza",         "Comisión: 5€"),
-    "papajohns":   ("Papa John's",       "Comisión: 5€"),
-    "kfc":         ("KFC",               "Comisión: 7€"),
-    "uber_glovo":  ("Uber Eats / Glovo",  "Comisión: 40% del carrito"),
+    "telepizza":   ("Telepizza",    5.0),
+    "papajohns":   ("Papa John's",  5.0),
+    "kfc":         ("KFC",          7.0),
+}
+
+# Opciones que NO son comida: precio fijo y cada una pide su propia
+# información en vez de "qué quieres pedir" (y no piden teléfono/dirección).
+# clave -> (nombre, precio fijo en €, pregunta específica a mostrar)
+EVENTOS = {
+    "cinesa":     ("Cinesa", 5.0, "🎬 Dinos la película, la sesión (fecha y hora) y cuántas entradas quieres."),
+    "forvenues":  ("Fever / Venues", 5.0, "🎫 Dinos el evento, la fecha y cuántas entradas quieres."),
 }
 
 # ─── PRODUCTOS: ROPA ───────────────────────────────────────────────
@@ -248,8 +255,12 @@ def cancelar_conv_keyboard():
 
 def teclado_restaurantes():
     filas = [
-        [InlineKeyboardButton(f"{nombre} — {comision}", callback_data=f"restaurante_{clave}")]
-        for clave, (nombre, comision) in PLATAFORMAS.items()
+        [InlineKeyboardButton(f"{nombre} — {precio:.2f}€", callback_data=f"restaurante_{clave}")]
+        for clave, (nombre, precio) in PLATAFORMAS.items()
+    ]
+    filas += [
+        [InlineKeyboardButton(f"{nombre} — {precio:.2f}€", callback_data=f"evento_{clave}")]
+        for clave, (nombre, precio, _pregunta) in EVENTOS.items()
     ]
     filas.append([InlineKeyboardButton("✏️ Pedido personalizado", callback_data="restaurante_personalizado")])
     filas.append([InlineKeyboardButton("❌ Cancelar pedido", callback_data="cancelar_conv")])
@@ -942,6 +953,8 @@ async def seleccionar_restaurante_callback(update: Update, context: ContextTypes
         context.user_data["restaurante_clave"] = "personalizado"
         context.user_data["restaurante_nombre"] = "Pedido personalizado"
         context.user_data["comision_texto"] = "A consultar"
+        context.user_data["precio_fijo"] = False
+        context.user_data["es_evento"] = False
         await q.edit_message_text(
             "✏️ *Pedido personalizado*\n\n"
             "Cuéntanos qué quieres pedir y dónde (restaurante, tienda, plataforma...).",
@@ -950,14 +963,36 @@ async def seleccionar_restaurante_callback(update: Update, context: ContextTypes
         )
         return PEDIDO
 
-    nombre, comision = PLATAFORMAS[clave]
+    nombre, precio = PLATAFORMAS[clave]
     context.user_data["restaurante_clave"] = clave
     context.user_data["restaurante_nombre"] = nombre
-    context.user_data["comision_texto"] = comision
+    context.user_data["comision_texto"] = f"{precio:.2f}€ (precio fijo)"
+    context.user_data["precio_eur"] = precio
+    context.user_data["precio_fijo"] = True
+    context.user_data["es_evento"] = False
 
     await q.edit_message_text(
-        f"🍔 *Pedido en {nombre}* ({comision})\n\n"
+        f"🍔 *Pedido en {nombre}* ({precio:.2f}€)\n\n"
         f"Escribe qué quieres pedir (ej. _2 hamburguesas, 1 patatas grandes, 1 refresco_).",
+        parse_mode="Markdown",
+        reply_markup=cancelar_conv_keyboard()
+    )
+    return PEDIDO
+
+async def seleccionar_evento_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clave = q.data.split("_", 1)[1]
+    nombre, precio, pregunta = EVENTOS[clave]
+    context.user_data["restaurante_clave"] = clave
+    context.user_data["restaurante_nombre"] = nombre
+    context.user_data["comision_texto"] = f"{precio:.2f}€ (precio fijo)"
+    context.user_data["precio_eur"] = precio
+    context.user_data["precio_fijo"] = True
+    context.user_data["es_evento"] = True
+
+    await q.edit_message_text(
+        f"🎟️ *{nombre}* — {precio:.2f}€\n\n{pregunta}",
         parse_mode="Markdown",
         reply_markup=cancelar_conv_keyboard()
     )
@@ -983,6 +1018,14 @@ async def recibir_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def recibir_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["email"] = update.message.text
+
+    if context.user_data.get("es_evento"):
+        # Cinesa / Fever-Venues: no hace falta teléfono, dirección ni comentarios.
+        context.user_data["telefono"] = "-"
+        context.user_data["direccion"] = "-"
+        context.user_data["comentarios"] = "-"
+        return await mostrar_resumen(update.message, context)
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭️ No quiero dar mi teléfono", callback_data="saltar_telefono")],
         [InlineKeyboardButton("❌ Cancelar pedido", callback_data="cancelar_conv")]
@@ -1028,12 +1071,16 @@ async def pedir_comentarios(message, context, editar=False):
 
 async def recibir_comentarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["comentarios"] = update.message.text
+    if context.user_data.get("precio_fijo"):
+        return await mostrar_resumen(update.message, context)
     return await pedir_precio_pedido(update.message, context)
 
 async def saltar_comentarios_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data["comentarios"] = "-"
+    if context.user_data.get("precio_fijo"):
+        return await mostrar_resumen(q.message, context, editar=True)
     return await pedir_precio_pedido(q.message, context, editar=True)
 
 async def pedir_precio_pedido(message, context, editar=False):
@@ -1210,6 +1257,7 @@ def main():
         states={
             RESTAURANTE: [
                 CallbackQueryHandler(seleccionar_restaurante_callback, pattern="^restaurante_"),
+                CallbackQueryHandler(seleccionar_evento_callback, pattern="^evento_"),
                 CallbackQueryHandler(cancelar_conv_callback, pattern="^cancelar_conv$"),
             ],
             PEDIDO: [
