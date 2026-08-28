@@ -219,6 +219,15 @@ def load_db():
     db.setdefault("_config", {})
     db.setdefault("compras", {})
     db.setdefault("ultimo_compra_numero", 0)
+    db.setdefault("regalo", {
+        "activo": False,
+        "texto": "",
+        "imagen_file_id": None,
+        "cupo_total": 0,
+        "cupo_restante": 0,
+        "reclamado_por": [],
+        "esperando_imagen": False,
+    })
     return db
 
 def save_db(db):
@@ -239,12 +248,13 @@ ESTADOS_PEDIDO = {
 # ─── TECLADOS ─────────────────────────────────────────────────────
 def menu_principal():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Perfil", callback_data="cat_perfil")],
         [InlineKeyboardButton("🍔 Pedidos a domicilio", callback_data="cat_pedidos")],
         [InlineKeyboardButton("🧥 CC", callback_data="cat_ropa")],
         [InlineKeyboardButton("🎬 Cuentas", callback_data="cat_pantalones")],
         [InlineKeyboardButton("💰 Saldo", callback_data="cat_saldo")],
         [InlineKeyboardButton("📱 eSIM", callback_data="cat_target")],
-        [InlineKeyboardButton("👤 Perfil", callback_data="cat_perfil")],
+        [InlineKeyboardButton("🎁 Regalos Aleatorios", callback_data="cat_regalo")],
         [InlineKeyboardButton("🆘 Soporte", url=f"https://t.me/{CONTACTO_ADMIN}")],
     ])
 
@@ -998,6 +1008,91 @@ async def cmd_entregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_db(db)
     await update.message.reply_text(f"✅ Marcado como entregado: nivel {nivel} para el usuario {uid}.")
 
+# ─── COMANDOS DE ADMINISTRACIÓN: REGALOS ALEATORIOS ────────────────
+async def cmd_setregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cambia el texto del regalo actual. Uso: /setregalo <texto>
+    Admite varias líneas si el mensaje que escribes ya las tiene."""
+    if not es_admin(update.effective_user.id):
+        return
+    partes = update.message.text.split(" ", 1)
+    if len(partes) < 2 or not partes[1].strip():
+        await update.message.reply_text("Uso: /setregalo <texto del regalo>\nPuedes escribir varias líneas.")
+        return
+    db = load_db()
+    regalo = db.setdefault("regalo", {})
+    regalo["texto"] = partes[1]
+    save_db(db)
+    await update.message.reply_text("✅ Texto del regalo actualizado.")
+
+async def cmd_setcupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fija cuántas unidades hay disponibles y reinicia quién lo ha reclamado.
+    Uso: /setcupo <número>  (ej. /setcupo 5 → los primeros 5 que reclamen se lo llevan)"""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /setcupo <número>\nEj: /setcupo 5")
+        return
+    try:
+        cupo = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("El cupo debe ser un número.")
+        return
+    db = load_db()
+    regalo = db.setdefault("regalo", {})
+    regalo["cupo_total"] = cupo
+    regalo["cupo_restante"] = cupo
+    regalo["reclamado_por"] = []
+    regalo["activo"] = cupo > 0
+    save_db(db)
+    await update.message.reply_text(f"✅ Cupo puesto a {cupo}. Reclamos reiniciados — el regalo está {'activo' if cupo > 0 else 'inactivo'}.")
+
+async def cmd_imagenregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prepara el bot para recibir la próxima foto que mandes como imagen del regalo."""
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    regalo = db.setdefault("regalo", {})
+    regalo["esperando_imagen"] = True
+    save_db(db)
+    await update.message.reply_text("📷 Envíame ahora la imagen que quieres usar para el regalo.")
+
+async def cmd_quitarimagenregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    regalo = db.setdefault("regalo", {})
+    regalo["imagen_file_id"] = None
+    save_db(db)
+    await update.message.reply_text("🗑️ Imagen del regalo eliminada (el regalo se queda solo con texto, si lo tiene).")
+
+async def cmd_verregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    regalo = db.get("regalo", {})
+    await update.message.reply_text(
+        f"🎁 *Estado del regalo*\n\n"
+        f"Estado: {'✅ Activo' if regalo.get('activo') else '❌ Inactivo'}\n"
+        f"Texto: {regalo.get('texto') or '(sin texto configurado)'}\n"
+        f"Imagen adjunta: {'Sí' if regalo.get('imagen_file_id') else 'No'}\n"
+        f"Cupo: {regalo.get('cupo_restante', 0)}/{regalo.get('cupo_total', 0)} restante\n"
+        f"Reclamado por {len(regalo.get('reclamado_por', []))} persona(s)",
+        parse_mode="Markdown"
+    )
+
+async def capturar_imagen_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Si un admin pidió /imagenregalo, la siguiente foto que mande se guarda como imagen del regalo."""
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    regalo = db.setdefault("regalo", {})
+    if not regalo.get("esperando_imagen"):
+        return
+    regalo["imagen_file_id"] = update.message.photo[-1].file_id
+    regalo["esperando_imagen"] = False
+    save_db(db)
+    await update.message.reply_text("✅ Imagen del regalo guardada.")
+
 # ─── CATEGORÍA: PEDIDOS A DOMICILIO ───────────────────────────────
 async def categoria_pedidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1099,6 +1194,94 @@ async def categoria_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, "eSIM", PRECIO_TARGET)
     await iniciar_pago(q, context, compra_id, PRECIO_TARGET, "eSIM")
+
+# ─── CATEGORÍA: REGALOS ALEATORIOS ─────────────────────────────────
+# Cupo compartido (no es "uno por persona"): los primeros que pulsen "Reclamar"
+# se lo llevan, hasta agotar las unidades configuradas con /setcupo.
+async def categoria_regalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    db = load_db()
+    regalo = db.get("regalo", {})
+    uid = q.from_user.id
+    disponible = regalo.get("activo") and regalo.get("cupo_restante", 0) > 0
+
+    if not disponible:
+        await q.edit_message_text(
+            "🎁 *Regalos Aleatorios*\n\nAhora mismo no hay ningún regalo disponible. ¡Vuelve a mirar más tarde!",
+            parse_mode="Markdown",
+            reply_markup=volver_menu_keyboard()
+        )
+        return
+
+    if uid in regalo.get("reclamado_por", []):
+        await q.edit_message_text(
+            "🎁 Ya reclamaste este regalo. ¡Espera al próximo!",
+            parse_mode="Markdown",
+            reply_markup=volver_menu_keyboard()
+        )
+        return
+
+    texto = regalo.get("texto") or "¡Hay un regalo disponible!"
+    restante = regalo.get("cupo_restante", 0)
+    caption = f"🎁 *¡REGALO DISPONIBLE!*\n\n{texto}\n\n🏃 Quedan *{restante}* unidad(es) — ¡sé de los primeros en reclamarlo!"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎉 Reclamar", callback_data="regalo_reclamar")],
+        [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
+    ])
+
+    imagen = regalo.get("imagen_file_id")
+    # Si hay imagen, no se puede "editar" un mensaje de texto para convertirlo en foto,
+    # así que se borra el mensaje del menú y se manda uno nuevo con la foto.
+    if imagen:
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_photo(chat_id=uid, photo=imagen, caption=caption, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await q.edit_message_text(caption, parse_mode="Markdown", reply_markup=kb)
+
+async def regalo_reclamar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    db = load_db()
+    regalo = db.setdefault("regalo", {})
+    uid = q.from_user.id
+
+    if not regalo.get("activo") or regalo.get("cupo_restante", 0) <= 0:
+        await q.answer("Este regalo ya no está disponible.", show_alert=True)
+        return
+    if uid in regalo.get("reclamado_por", []):
+        await q.answer("Ya lo reclamaste antes.", show_alert=True)
+        return
+
+    regalo.setdefault("reclamado_por", []).append(uid)
+    regalo["cupo_restante"] = regalo.get("cupo_restante", 0) - 1
+    if regalo["cupo_restante"] <= 0:
+        regalo["activo"] = False
+    save_db(db)
+
+    texto_final = f"🎉 *¡REGALO RECLAMADO!*\n\n{regalo.get('texto', '')}"
+    try:
+        if regalo.get("imagen_file_id"):
+            await q.edit_message_caption(caption=texto_final, parse_mode="Markdown", reply_markup=volver_menu_keyboard())
+        else:
+            await q.edit_message_text(texto_final, parse_mode="Markdown", reply_markup=volver_menu_keyboard())
+    except Exception:
+        pass
+
+    try:
+        await context.bot.send_message(
+            chat_id=GRUPO_ADMIN_ID,
+            text=(
+                f"🎁 @{q.from_user.username or q.from_user.first_name} (ID `{uid}`) reclamó el regalo.\n"
+                f"Quedan {regalo['cupo_restante']} unidad(es)."
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 
 # ─── VER ESTADO DEL PEDIDO (botón, no comando) ─────────────────────
 async def ver_estado_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1527,6 +1710,14 @@ def main():
     app.add_handler(CommandHandler("premios", cmd_premios))
     app.add_handler(CommandHandler("pendientes", cmd_pendientes))
     app.add_handler(CommandHandler("entregar", cmd_entregar))
+    app.add_handler(CommandHandler("setregalo", cmd_setregalo))
+    app.add_handler(CommandHandler("setcupo", cmd_setcupo))
+    app.add_handler(CommandHandler("imagenregalo", cmd_imagenregalo))
+    app.add_handler(CommandHandler("quitarimagenregalo", cmd_quitarimagenregalo))
+    app.add_handler(CommandHandler("verregalo", cmd_verregalo))
+    app.add_handler(CallbackQueryHandler(categoria_regalo, pattern="^cat_regalo$"))
+    app.add_handler(CallbackQueryHandler(regalo_reclamar_callback, pattern="^regalo_reclamar$"))
+    app.add_handler(MessageHandler(filters.PHOTO, capturar_imagen_admin))
     app.add_handler(CallbackQueryHandler(pago_cripto_callback, pattern="^pagocrypto_"))
     app.add_handler(CallbackQueryHandler(pago_transferencia_callback, pattern="^pagotransfer_"))
     app.add_handler(CallbackQueryHandler(pago_moneda_callback, pattern="^pagomoneda_"))
