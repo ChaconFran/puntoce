@@ -219,15 +219,7 @@ def load_db():
     db.setdefault("_config", {})
     db.setdefault("compras", {})
     db.setdefault("ultimo_compra_numero", 0)
-    db.setdefault("regalo", {
-        "activo": False,
-        "texto": "",
-        "imagen_file_id": None,
-        "cupo_total": 0,
-        "cupo_restante": 0,
-        "reclamado_por": [],
-        "esperando_imagen": False,
-    })
+    db.setdefault("regalos", [])  # lista de regalos independientes, ver /addregalo
     return db
 
 def save_db(db):
@@ -628,6 +620,9 @@ async def _confirmar_compra(context, db, compra_id, compra):
     """Marca la compra como confirmada, otorga XP y hace la entrega automática si aplica.
     Usada tanto por la verificación automática como por el botón manual del admin.
     Devuelve (texto_extra_para_comprador, texto_extra_para_admin)."""
+    if compra.get("estado") == "confirmada":
+        # Ya se confirmó por la otra vía (cerrojo de seguridad extra) — no repetir XP ni stock.
+        return "", ""
     compra["estado"] = "confirmada"
     comprador_id = str(compra["comprador_id"])
     comprador = get_usuario(db, comprador_id)
@@ -660,6 +655,22 @@ async def capturar_hash_pago(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not compra:
         context.user_data.pop("compra_esperando_hash", None)
         return
+
+    # Cerrojo anti-doble-ejecución: si esta compra ya no está en "esperando_hash"
+    # (porque ya se está verificando, ya se confirmó, o ya cayó a manual), no se
+    # vuelve a procesar. Esto es lo que evita que la verificación automática y la
+    # confirmación manual del admin puedan "chocar" y ejecutarse las dos para la
+    # misma compra (doble XP, doble entrega de stock, etc.).
+    if compra.get("estado") != "esperando_hash":
+        context.user_data.pop("compra_esperando_hash", None)
+        await update.message.reply_text(
+            "Esta compra ya está siendo procesada o ya fue verificada, no hace falta reenviar el hash.",
+            reply_markup=volver_menu_keyboard()
+        )
+        return
+
+    compra["estado"] = "verificando"
+    save_db(db)
 
     compra["hash"] = hash_tx
     context.user_data.pop("compra_esperando_hash", None)
@@ -1013,89 +1024,136 @@ async def cmd_entregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Marcado como entregado: nivel {nivel} para el usuario {uid}.")
 
 # ─── COMANDOS DE ADMINISTRACIÓN: REGALOS ALEATORIOS ────────────────
-async def cmd_setregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cambia el texto del regalo actual. Uso: /setregalo <texto>
-    Admite varias líneas si el mensaje que escribes ya las tiene."""
+async def cmd_addregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Crea un nuevo regalo independiente (empieza con 1 unidad).
+    Uso: /addregalo <texto>  (admite varias líneas)"""
     if not es_admin(update.effective_user.id):
         return
     partes = update.message.text.split(" ", 1)
     if len(partes) < 2 or not partes[1].strip():
-        await update.message.reply_text("Uso: /setregalo <texto del regalo>\nPuedes escribir varias líneas.")
+        await update.message.reply_text("Uso: /addregalo <texto>\nCrea un regalo nuevo con 1 unidad disponible.")
         return
     db = load_db()
-    regalo = db.setdefault("regalo", {})
-    regalo["texto"] = partes[1]
+    cfg = db.setdefault("_config", {})
+    cfg["ultimo_regalo_id"] = cfg.get("ultimo_regalo_id", 0) + 1
+    nuevo_id = cfg["ultimo_regalo_id"]
+    db.setdefault("regalos", []).append({
+        "id": nuevo_id,
+        "texto": partes[1],
+        "imagen_file_id": None,
+        "cupo_total": 1,
+        "cupo_restante": 1,
+        "reclamado_por": [],
+    })
     save_db(db)
-    await update.message.reply_text("✅ Texto del regalo actualizado.")
+    await update.message.reply_text(
+        f"✅ Regalo #{nuevo_id} creado con 1 unidad.\n"
+        f"• /imagenregalo {nuevo_id} — añadirle una foto\n"
+        f"• /setcupogregalo {nuevo_id} <n> — cambiar las unidades"
+    )
 
-async def cmd_setcupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fija cuántas unidades hay disponibles y reinicia quién lo ha reclamado.
-    Uso: /setcupo <número>  (ej. /setcupo 5 → los primeros 5 que reclamen se lo llevan)"""
+async def cmd_quitarregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Elimina un regalo por completo. Uso: /quitarregalo <id>"""
     if not es_admin(update.effective_user.id):
         return
     if len(context.args) != 1:
-        await update.message.reply_text("Uso: /setcupo <número>\nEj: /setcupo 5")
+        await update.message.reply_text("Uso: /quitarregalo <id>")
         return
     try:
-        cupo = int(context.args[0])
+        id_ = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("El cupo debe ser un número.")
+        await update.message.reply_text("El id debe ser un número.")
         return
     db = load_db()
-    regalo = db.setdefault("regalo", {})
-    regalo["cupo_total"] = cupo
-    regalo["cupo_restante"] = cupo
-    regalo["reclamado_por"] = []
-    regalo["activo"] = cupo > 0
+    regalos = db.get("regalos", [])
+    nuevos = [g for g in regalos if g["id"] != id_]
+    if len(nuevos) == len(regalos):
+        await update.message.reply_text("No encuentro ningún regalo con ese id.")
+        return
+    db["regalos"] = nuevos
     save_db(db)
-    await update.message.reply_text(f"✅ Cupo puesto a {cupo}. Reclamos reiniciados — el regalo está {'activo' if cupo > 0 else 'inactivo'}.")
+    await update.message.reply_text(f"🗑️ Regalo #{id_} eliminado.")
+
+async def cmd_setcupogregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fija las unidades de un regalo concreto y reinicia quién lo ha reclamado.
+    Uso: /setcupogregalo <id> <n>"""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Uso: /setcupogregalo <id> <n>")
+        return
+    try:
+        id_, n = int(context.args[0]), int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("El id y el cupo deben ser números.")
+        return
+    db = load_db()
+    regalo = next((g for g in db.get("regalos", []) if g["id"] == id_), None)
+    if not regalo:
+        await update.message.reply_text("No encuentro ningún regalo con ese id.")
+        return
+    regalo["cupo_total"] = n
+    regalo["cupo_restante"] = n
+    regalo["reclamado_por"] = []
+    save_db(db)
+    await update.message.reply_text(f"✅ Regalo #{id_} ahora tiene {n} unidad(es) (reclamos reiniciados).")
 
 async def cmd_imagenregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prepara el bot para recibir la próxima foto que mandes como imagen del regalo."""
+    """Prepara el bot para recibir una foto y asignarla a un regalo concreto.
+    Uso: /imagenregalo <id>  y luego mandas la foto."""
     if not es_admin(update.effective_user.id):
         return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /imagenregalo <id>\nLuego mándame la foto.")
+        return
+    try:
+        id_ = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("El id debe ser un número.")
+        return
     db = load_db()
-    regalo = db.setdefault("regalo", {})
-    regalo["esperando_imagen"] = True
+    regalo = next((g for g in db.get("regalos", []) if g["id"] == id_), None)
+    if not regalo:
+        await update.message.reply_text("No encuentro ningún regalo con ese id.")
+        return
+    cfg = db.setdefault("_config", {})
+    cfg["esperando_imagen_regalo_id"] = id_
     save_db(db)
-    await update.message.reply_text("📷 Envíame ahora la imagen que quieres usar para el regalo.")
+    await update.message.reply_text(f"📷 Envíame ahora la imagen para el regalo #{id_}.")
 
-async def cmd_quitarimagenregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_verregalos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_admin(update.effective_user.id):
         return
     db = load_db()
-    regalo = db.setdefault("regalo", {})
-    regalo["imagen_file_id"] = None
-    save_db(db)
-    await update.message.reply_text("🗑️ Imagen del regalo eliminada (el regalo se queda solo con texto, si lo tiene).")
-
-async def cmd_verregalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not es_admin(update.effective_user.id):
+    regalos = db.get("regalos", [])
+    if not regalos:
+        await update.message.reply_text("No hay ningún regalo creado. Usa /addregalo <texto>.")
         return
-    db = load_db()
-    regalo = db.get("regalo", {})
-    await update.message.reply_text(
-        f"🎁 *Estado del regalo*\n\n"
-        f"Estado: {'✅ Activo' if regalo.get('activo') else '❌ Inactivo'}\n"
-        f"Texto: {regalo.get('texto') or '(sin texto configurado)'}\n"
-        f"Imagen adjunta: {'Sí' if regalo.get('imagen_file_id') else 'No'}\n"
-        f"Cupo: {regalo.get('cupo_restante', 0)}/{regalo.get('cupo_total', 0)} restante\n"
-        f"Reclamado por {len(regalo.get('reclamado_por', []))} persona(s)",
-        parse_mode="Markdown"
-    )
+    lineas = []
+    for g in regalos:
+        resumen = g["texto"][:40] + ("..." if len(g["texto"]) > 40 else "")
+        imagen_txt = "📷" if g.get("imagen_file_id") else "sin imagen"
+        lineas.append(f"#{g['id']}: {resumen} — {g['cupo_restante']}/{g['cupo_total']} — {imagen_txt}")
+    await update.message.reply_text("🎁 *Regalos configurados:*\n\n" + "\n".join(lineas), parse_mode="Markdown")
 
 async def capturar_imagen_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Si un admin pidió /imagenregalo, la siguiente foto que mande se guarda como imagen del regalo."""
+    """Si un admin pidió /imagenregalo <id>, la siguiente foto que mande se asigna a ese regalo."""
     if not es_admin(update.effective_user.id):
         return
     db = load_db()
-    regalo = db.setdefault("regalo", {})
-    if not regalo.get("esperando_imagen"):
+    cfg = db.setdefault("_config", {})
+    id_ = cfg.get("esperando_imagen_regalo_id")
+    if not id_:
+        return
+    regalo = next((g for g in db.get("regalos", []) if g["id"] == id_), None)
+    if not regalo:
+        cfg["esperando_imagen_regalo_id"] = None
+        save_db(db)
         return
     regalo["imagen_file_id"] = update.message.photo[-1].file_id
-    regalo["esperando_imagen"] = False
+    cfg["esperando_imagen_regalo_id"] = None
     save_db(db)
-    await update.message.reply_text("✅ Imagen del regalo guardada.")
+    await update.message.reply_text(f"✅ Imagen guardada para el regalo #{id_}.")
 
 # ─── COMANDOS DE ADMINISTRACIÓN: GESTIÓN DE ADMINS ─────────────────
 async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1272,12 +1330,12 @@ async def cmd_adminayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /pendientes — premios desbloqueados sin entregar
 /entregar <ID> <nivel> — marcar premio como entregado
 
-*Regalo aleatorio*
-/verregalo — ver estado del regalo
-/setregalo <texto> — cambiar el texto
-/imagenregalo — la próxima foto que mandes será la imagen
-/quitarimagenregalo — quitar la imagen
-/setcupo <n> — activar con n unidades (reinicia reclamos)
+*Regalos aleatorios*
+/verregalos — ver todos los regalos configurados
+/addregalo <texto> — crear un regalo nuevo (empieza con 1 unidad)
+/imagenregalo <id> — la próxima foto que mandes se asigna a ese regalo
+/setcupogregalo <id> <n> — cambiar las unidades de un regalo (reinicia reclamos)
+/quitarregalo <id> — eliminar un regalo por completo
 
 *Pedidos*
 /cola — ver pedidos activos
@@ -1402,60 +1460,92 @@ async def categoria_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await iniciar_pago(q, context, compra_id, PRECIO_TARGET, "eSIM")
 
 # ─── CATEGORÍA: REGALOS ALEATORIOS ─────────────────────────────────
-# Cupo compartido (no es "uno por persona"): los primeros que pulsen "Reclamar"
-# se lo llevan, hasta agotar las unidades configuradas con /setcupo.
-async def categoria_regalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+# Cada regalo es independiente (su propio texto/imagen/cupo). Si hay varios
+# disponibles a la vez, se navegan con ⬅️/➡️. Al reclamarse, ese regalo
+# concreto se borra del chat (mensaje y foto incluidos) y desaparece de la
+# lista si se agota su cupo. No es "uno por persona": es un cupo compartido
+# por regalo, para los primeros que lo reclamen.
+async def _mostrar_regalo_en_indice(q, context, indice):
     db = load_db()
-    regalo = db.get("regalo", {})
+    disponibles = [g for g in db.get("regalos", []) if g.get("cupo_restante", 0) > 0]
+
+    if not disponibles:
+        try:
+            await q.edit_message_text(
+                "🎁 *Regalos Aleatorios*\n\nAhora mismo no hay ningún regalo disponible. ¡Vuelve a mirar más tarde!",
+                parse_mode="Markdown",
+                reply_markup=volver_menu_keyboard()
+            )
+        except Exception:
+            pass
+        return
+
+    indice = max(0, min(indice, len(disponibles) - 1))
+    regalo = disponibles[indice]
     uid = q.from_user.id
-    disponible = regalo.get("activo") and regalo.get("cupo_restante", 0) > 0
-
-    if not disponible:
-        await q.edit_message_text(
-            "🎁 *Regalos Aleatorios*\n\nAhora mismo no hay ningún regalo disponible. ¡Vuelve a mirar más tarde!",
-            parse_mode="Markdown",
-            reply_markup=volver_menu_keyboard()
-        )
-        return
-
-    if uid in regalo.get("reclamado_por", []):
-        await q.edit_message_text(
-            "🎁 Ya reclamaste este regalo. ¡Espera al próximo!",
-            parse_mode="Markdown",
-            reply_markup=volver_menu_keyboard()
-        )
-        return
+    ya_reclamado = uid in regalo.get("reclamado_por", [])
 
     texto = regalo.get("texto") or "¡Hay un regalo disponible!"
-    restante = regalo.get("cupo_restante", 0)
-    caption = f"🎁 *¡REGALO DISPONIBLE!*\n\n{texto}\n\n🏃 Quedan *{restante}* unidad(es) — ¡sé de los primeros en reclamarlo!"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎉 Reclamar", callback_data="regalo_reclamar")],
-        [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
-    ])
+    cabecera = f"🎁 *Regalo {indice + 1}/{len(disponibles)}*\n\n{texto}\n\n🏃 Quedan *{regalo['cupo_restante']}* unidad(es)."
+    if ya_reclamado:
+        cabecera += "\n\n✅ Ya reclamaste este regalo."
+
+    fila_nav = []
+    if indice > 0:
+        fila_nav.append(InlineKeyboardButton("⬅️", callback_data=f"regalo_ver_{indice - 1}"))
+    if indice < len(disponibles) - 1:
+        fila_nav.append(InlineKeyboardButton("➡️", callback_data=f"regalo_ver_{indice + 1}"))
+
+    filas = []
+    if fila_nav:
+        filas.append(fila_nav)
+    if not ya_reclamado:
+        filas.append([InlineKeyboardButton("🎉 Reclamar", callback_data=f"regalo_reclamar_{regalo['id']}")])
+    filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
+    kb = InlineKeyboardMarkup(filas)
 
     imagen = regalo.get("imagen_file_id")
-    # Si hay imagen, no se puede "editar" un mensaje de texto para convertirlo en foto,
-    # así que se borra el mensaje del menú y se manda uno nuevo con la foto.
-    if imagen:
+    es_foto_actual = bool(q.message.photo)
+
+    # No se puede "editar" un mensaje de texto para volverlo foto (ni al revés),
+    # así que en esos casos se borra y se manda uno nuevo del tipo que toque.
+    if imagen and not es_foto_actual:
         try:
             await q.message.delete()
         except Exception:
             pass
-        await context.bot.send_photo(chat_id=uid, photo=imagen, caption=caption, parse_mode="Markdown", reply_markup=kb)
+        await context.bot.send_photo(chat_id=uid, photo=imagen, caption=cabecera, parse_mode="Markdown", reply_markup=kb)
+    elif imagen and es_foto_actual:
+        await q.edit_message_caption(caption=cabecera, parse_mode="Markdown", reply_markup=kb)
+    elif not imagen and es_foto_actual:
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(chat_id=uid, text=cabecera, parse_mode="Markdown", reply_markup=kb)
     else:
-        await q.edit_message_text(caption, parse_mode="Markdown", reply_markup=kb)
+        await q.edit_message_text(cabecera, parse_mode="Markdown", reply_markup=kb)
+
+async def categoria_regalo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await _mostrar_regalo_en_indice(q, context, 0)
+
+async def regalo_ver_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    indice = int(q.data.split("_")[-1])
+    await _mostrar_regalo_en_indice(q, context, indice)
 
 async def regalo_reclamar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    regalo_id = int(q.data.split("_")[-1])
     db = load_db()
-    regalo = db.setdefault("regalo", {})
+    regalo = next((g for g in db.get("regalos", []) if g["id"] == regalo_id), None)
     uid = q.from_user.id
 
-    if not regalo.get("activo") or regalo.get("cupo_restante", 0) <= 0:
+    if not regalo or regalo.get("cupo_restante", 0) <= 0:
         await q.answer("Este regalo ya no está disponible.", show_alert=True)
         return
     if uid in regalo.get("reclamado_por", []):
@@ -1463,26 +1553,27 @@ async def regalo_reclamar_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     regalo.setdefault("reclamado_por", []).append(uid)
-    regalo["cupo_restante"] = regalo.get("cupo_restante", 0) - 1
-    if regalo["cupo_restante"] <= 0:
-        regalo["activo"] = False
+    regalo["cupo_restante"] -= 1
     save_db(db)
 
-    texto_final = f"🎉 *¡REGALO RECLAMADO!*\n\n{regalo.get('texto', '')}"
+    # Se borra el mensaje del regalo (texto o foto) tal como se pidió, en vez de dejarlo editado.
     try:
-        if regalo.get("imagen_file_id"):
-            await q.edit_message_caption(caption=texto_final, parse_mode="Markdown", reply_markup=volver_menu_keyboard())
-        else:
-            await q.edit_message_text(texto_final, parse_mode="Markdown", reply_markup=volver_menu_keyboard())
+        await q.message.delete()
     except Exception:
         pass
+    await context.bot.send_message(
+        chat_id=uid,
+        text=f"🎉 *¡Regalo reclamado!*\n\n{regalo.get('texto', '')}",
+        parse_mode="Markdown",
+        reply_markup=volver_menu_keyboard()
+    )
 
     try:
         await context.bot.send_message(
             chat_id=GRUPO_ADMIN_ID,
             text=(
-                f"🎁 @{q.from_user.username or q.from_user.first_name} (ID `{uid}`) reclamó el regalo.\n"
-                f"Quedan {regalo['cupo_restante']} unidad(es)."
+                f"🎁 @{q.from_user.username or q.from_user.first_name} (ID `{uid}`) reclamó el regalo #{regalo_id}.\n"
+                f"Quedan {regalo['cupo_restante']} unidad(es) de ese regalo."
             ),
             parse_mode="Markdown"
         )
@@ -1916,11 +2007,11 @@ def main():
     app.add_handler(CommandHandler("premios", cmd_premios))
     app.add_handler(CommandHandler("pendientes", cmd_pendientes))
     app.add_handler(CommandHandler("entregar", cmd_entregar))
-    app.add_handler(CommandHandler("setregalo", cmd_setregalo))
-    app.add_handler(CommandHandler("setcupo", cmd_setcupo))
+    app.add_handler(CommandHandler("addregalo", cmd_addregalo))
+    app.add_handler(CommandHandler("quitarregalo", cmd_quitarregalo))
+    app.add_handler(CommandHandler("setcupogregalo", cmd_setcupogregalo))
     app.add_handler(CommandHandler("imagenregalo", cmd_imagenregalo))
-    app.add_handler(CommandHandler("quitarimagenregalo", cmd_quitarimagenregalo))
-    app.add_handler(CommandHandler("verregalo", cmd_verregalo))
+    app.add_handler(CommandHandler("verregalos", cmd_verregalos))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("deladmin", cmd_deladmin))
     app.add_handler(CommandHandler("admins", cmd_admins))
@@ -1932,7 +2023,8 @@ def main():
     app.add_handler(CommandHandler("resetxp", cmd_resetxp))
     app.add_handler(CommandHandler("adminayuda", cmd_adminayuda))
     app.add_handler(CallbackQueryHandler(categoria_regalo, pattern="^cat_regalo$"))
-    app.add_handler(CallbackQueryHandler(regalo_reclamar_callback, pattern="^regalo_reclamar$"))
+    app.add_handler(CallbackQueryHandler(regalo_ver_callback, pattern="^regalo_ver_"))
+    app.add_handler(CallbackQueryHandler(regalo_reclamar_callback, pattern="^regalo_reclamar_"))
     app.add_handler(MessageHandler(filters.PHOTO, capturar_imagen_admin))
     app.add_handler(CallbackQueryHandler(pago_cripto_callback, pattern="^pagocrypto_"))
     app.add_handler(CallbackQueryHandler(pago_transferencia_callback, pattern="^pagotransfer_"))
