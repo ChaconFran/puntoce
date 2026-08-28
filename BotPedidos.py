@@ -11,14 +11,10 @@ from telegram.ext import (
 )
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Falta la variable de entorno BOT_TOKEN. Configúrala en Railway (pestaña Variables).")
+BOT_TOKEN = "8672882435:AAHECP0xEWorI9lQSc4R4JixIhnRXnzZ5j4"
 
 # ID del grupo de administradores donde llegan los pedidos.
-GRUPO_ADMIN_ID = int(os.environ.get("GRUPO_ADMIN_ID", "0"))
-if GRUPO_ADMIN_ID == 0:
-    raise RuntimeError("Falta la variable de entorno GRUPO_ADMIN_ID. Configúrala en Railway (pestaña Variables).")
+GRUPO_ADMIN_ID = -1004416626509
 
 DB_FILE = os.environ.get("DB_PATH", "pedidos.json")
 
