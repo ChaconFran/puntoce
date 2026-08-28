@@ -37,12 +37,38 @@ EVENTOS = {
     "forvenues":  ("Fever / Venues", 5.0, "🎫 Dinos el evento, la fecha y cuántas entradas quieres."),
 }
 
-# ─── PRODUCTOS: ROPA ───────────────────────────────────────────────
-# clave -> (nombre, precio en €)
+# Precio fijo para "Pedido personalizado" (ya no se pregunta el importe total).
+PRECIO_PERSONALIZADO = 6.0
+
+# ─── PRODUCTOS: CC (Cold Culture) ───────────────────────────────────
+# Antes "Ropa". Cada prenda tiene su propio archivo de stock (un ID de
+# producto por línea). Al confirmarse el pago, se toma automáticamente
+# el siguiente ID disponible y se le envía al comprador; ese ID se borra
+# del archivo para no repetirlo.
 ROPA = {
-    "camisetas": ("Camisetas", 5.0),
-    "pantalones": ("Pantalones", 8.0),
+    "camisetas":  ("Camisetas", 5.0, "stock_camisetas.txt"),
+    "pantalones": ("Pantalones", 8.0, "stock_pantalones_cc.txt"),
 }
+
+def tomar_id_stock(stock_file):
+    """Devuelve el siguiente ID disponible del archivo de stock y lo elimina de la lista.
+    Devuelve None si el archivo no existe o está vacío."""
+    if not os.path.exists(stock_file):
+        return None
+    with open(stock_file, "r", encoding="utf-8") as f:
+        lineas = [l.strip() for l in f if l.strip()]
+    if not lineas:
+        return None
+    id_tomado = lineas[0]
+    with open(stock_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lineas[1:]) + ("\n" if len(lineas) > 1 else ""))
+    return id_tomado
+
+def contar_stock(stock_file):
+    if not os.path.exists(stock_file):
+        return 0
+    with open(stock_file, "r", encoding="utf-8") as f:
+        return len([l for l in f if l.strip()])
 
 # ─── PRODUCTOS: SALDO ──────────────────────────────────────────────
 # clave -> (texto a mostrar, precio en € o None si no tiene coste)
@@ -65,7 +91,9 @@ NOMBRES_CRYPTO = {"ltc": "Litecoin (LTC)", "eth": "Ethereum (ETH)"}
 IDS_COINGECKO = {"ltc": "litecoin", "eth": "ethereum"}
 
 # XP que gana el propio comprador por cada euro gastado en una compra confirmada.
-XP_POR_EURO = 2
+# Bajado de 2 a 0.2: con XP_POR_EURO=2, comprar algo de 5€ ya daba XP suficiente
+# para saltar varios niveles de golpe en los primeros tramos de la curva.
+XP_POR_EURO = 0.2
 
 def obtener_precio_crypto_eur(moneda_id):
     """Consulta la cotización actual en euros de una cripto vía CoinGecko."""
@@ -211,6 +239,10 @@ ESTADOS_PEDIDO = {
 def menu_principal():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🍔 Pedidos a domicilio", callback_data="cat_pedidos")],
+        [InlineKeyboardButton("🧥 CC", callback_data="cat_ropa")],
+        [InlineKeyboardButton("🎬 Cuentas", callback_data="cat_pantalones")],
+        [InlineKeyboardButton("💰 Saldo", callback_data="cat_saldo")],
+        [InlineKeyboardButton("📱 eSIM", callback_data="cat_target")],
         [InlineKeyboardButton("🎯 Referidos", callback_data="cat_referidos")],
         [InlineKeyboardButton("🆘 Soporte", url=f"https://t.me/{CONTACTO_ADMIN}")],
     ])
@@ -234,7 +266,7 @@ def teclado_pedidos_menu():
 def teclado_ropa_menu():
     filas = [
         [InlineKeyboardButton(f"{nombre} — {precio:.0f}€", callback_data=f"ropa_{clave}")]
-        for clave, (nombre, precio) in ROPA.items()
+        for clave, (nombre, precio, _stock) in ROPA.items()
     ]
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(filas)
@@ -333,9 +365,33 @@ async def notificar_nuevos_premios(context, uid, u, nivel_anterior, nivel_nuevo,
         except Exception:
             pass
 
+# Máximo de niveles que un solo evento (un referido, una compra) puede hacer subir de golpe.
+# Evita que una compra grande o incluso el primer referido dispare al usuario muchos niveles
+# de una vez, ya que los primeros niveles de la curva cuestan muy poca XP.
+MAX_NIVELES_POR_EVENTO = 1
+
+def agregar_xp_con_tope(xp_actual, xp_ganada_bruta):
+    """Suma XP a un total, pero sin permitir que un único evento cruce más de
+    MAX_NIVELES_POR_EVENTO niveles. El excedente de XP no se concede (se pierde),
+    es la forma más simple y fiable de que "una compra" o "un referido" no dispare
+    de golpe media tabla de niveles."""
+    nivel_antes, *_ = calcular_nivel(xp_actual)
+    xp_propuesta = xp_actual + xp_ganada_bruta
+    nivel_propuesto, *_ = calcular_nivel(xp_propuesta)
+    nivel_tope = min(NIVEL_MAX, nivel_antes + MAX_NIVELES_POR_EVENTO)
+
+    if nivel_propuesto <= nivel_tope:
+        return xp_propuesta
+
+    if nivel_tope >= NIVEL_MAX:
+        return xp_propuesta  # ya en el tope de niveles disponible, no hay más que limitar
+
+    xp_maxima_en_tope = UMBRALES_NIVEL[nivel_tope] - 1  # justo antes de cruzar al siguiente nivel
+    return max(xp_actual, min(xp_propuesta, xp_maxima_en_tope))
+
 async def otorgar_xp(context, referrer_id, referrer_data, premios):
     nivel_antes, *_ = calcular_nivel(referrer_data["xp"])
-    referrer_data["xp"] += XP_POR_REFERIDO
+    referrer_data["xp"] = agregar_xp_con_tope(referrer_data["xp"], XP_POR_REFERIDO)
     nivel_despues, _, _, _ = calcular_nivel(referrer_data["xp"])
 
     if nivel_despues > nivel_antes:
@@ -354,7 +410,7 @@ async def otorgar_xp_compra(context, uid, u, precio_eur, premios):
     """El propio comprador gana XP por su compra confirmada (según lo gastado)."""
     xp_ganada = round(precio_eur * XP_POR_EURO)
     nivel_antes, *_ = calcular_nivel(u["xp"])
-    u["xp"] += xp_ganada
+    u["xp"] = agregar_xp_con_tope(u["xp"], xp_ganada)
     nivel_despues, _, _, _ = calcular_nivel(u["xp"])
 
     try:
@@ -379,7 +435,7 @@ async def otorgar_xp_compra(context, uid, u, precio_eur, premios):
     await notificar_nuevos_premios(context, uid, u, nivel_antes, nivel_despues, premios)
 
 # ─── SISTEMA DE COMPRAS Y PAGO (cripto / transferencia) ────────────
-def crear_compra(db, comprador_id, username, producto, precio_eur):
+def crear_compra(db, comprador_id, username, producto, precio_eur, auto_entrega=False, stock_file=None):
     db["ultimo_compra_numero"] += 1
     compra_id = db["ultimo_compra_numero"]
     db["compras"][str(compra_id)] = {
@@ -391,6 +447,8 @@ def crear_compra(db, comprador_id, username, producto, precio_eur):
         "estado": "pendiente_metodo",
         "hash": None,
         "creado_at": datetime.now().isoformat(),
+        "auto_entrega": auto_entrega,
+        "stock_file": stock_file,
     }
     save_db(db)
     return compra_id
@@ -566,14 +624,26 @@ async def compra_confirmar_callback(update: Update, context: ContextTypes.DEFAUL
     comprador_id = str(compra["comprador_id"])
     comprador = get_usuario(db, comprador_id)
     await otorgar_xp_compra(context, comprador_id, comprador, compra["precio_eur"], get_premios(db))
+
+    # Entrega automática de stock (ej. productos CC) si el producto lo requiere.
+    mensaje_comprador = f"✅ Hemos confirmado tu pago de la compra *#{compra_id}* ({compra['producto']}). ¡Gracias!"
+    aviso_admin_extra = ""
+    if compra.get("auto_entrega"):
+        id_producto = tomar_id_stock(compra["stock_file"])
+        if id_producto:
+            mensaje_comprador += f"\n\n🎟️ *Tu ID de producto:* `{id_producto}`"
+        else:
+            mensaje_comprador += "\n\n⚠️ Sin stock disponible ahora mismo. Te lo enviaremos en cuanto repongamos, disculpa la espera."
+            aviso_admin_extra = f"\n\n⚠️ *SIN STOCK* para reponer la compra #{compra_id} ({compra['producto']}). Revisa `{compra['stock_file']}`."
+
     save_db(db)
 
-    await q.edit_message_text(q.message.text_markdown + "\n\n✅ *PAGO CONFIRMADO*", parse_mode="Markdown")
+    await q.edit_message_text(q.message.text_markdown + "\n\n✅ *PAGO CONFIRMADO*" + aviso_admin_extra, parse_mode="Markdown")
 
     try:
         await context.bot.send_message(
             chat_id=compra["comprador_id"],
-            text=f"✅ Hemos confirmado tu pago de la compra *#{compra_id}* ({compra['producto']}). ¡Gracias!",
+            text=mensaje_comprador,
             parse_mode="Markdown"
         )
     except Exception:
@@ -810,7 +880,7 @@ async def categoria_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        "👕 *Ropa*\n\nElige una prenda:",
+        "🧥 *CC — Cold Culture*\n\nElige una prenda:",
         parse_mode="Markdown",
         reply_markup=teclado_ropa_menu()
     )
@@ -819,9 +889,12 @@ async def ver_producto_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     clave = q.data.split("_", 1)[1]
-    nombre, precio = ROPA[clave]
+    nombre, precio, stock_file = ROPA[clave]
     db = load_db()
-    compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, nombre, precio)
+    compra_id = crear_compra(
+        db, q.from_user.id, q.from_user.username or q.from_user.first_name,
+        nombre, precio, auto_entrega=True, stock_file=stock_file
+    )
     await iniciar_pago(q, context, compra_id, precio, nombre)
 
 # ─── CATEGORÍA: PANTALONES ──────────────────────────────────────────
@@ -841,7 +914,7 @@ async def categoria_pantalones(update: Update, context: ContextTypes.DEFAULT_TYP
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        f"👖 *Pantalones*\n\nTodas las opciones al mismo precio: *{PRECIO_PANTALONES:.2f}€*.\n\nElige una:",
+        f"🎬 *Cuentas*\n\nTodas las opciones al mismo precio: *{PRECIO_PANTALONES:.2f}€*.\n\nElige una:",
         parse_mode="Markdown",
         reply_markup=teclado_pantalones_menu()
     )
@@ -891,8 +964,8 @@ async def categoria_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, "Target", PRECIO_TARGET)
-    await iniciar_pago(q, context, compra_id, PRECIO_TARGET, "Target")
+    compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, "eSIM", PRECIO_TARGET)
+    await iniciar_pago(q, context, compra_id, PRECIO_TARGET, "eSIM")
 
 # ─── VER ESTADO DEL PEDIDO (botón, no comando) ─────────────────────
 async def ver_estado_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -952,11 +1025,12 @@ async def seleccionar_restaurante_callback(update: Update, context: ContextTypes
     if clave == "personalizado":
         context.user_data["restaurante_clave"] = "personalizado"
         context.user_data["restaurante_nombre"] = "Pedido personalizado"
-        context.user_data["comision_texto"] = "A consultar"
-        context.user_data["precio_fijo"] = False
+        context.user_data["comision_texto"] = f"{PRECIO_PERSONALIZADO:.2f}€ (precio fijo)"
+        context.user_data["precio_eur"] = PRECIO_PERSONALIZADO
+        context.user_data["precio_fijo"] = True
         context.user_data["es_evento"] = False
         await q.edit_message_text(
-            "✏️ *Pedido personalizado*\n\n"
+            f"✏️ *Pedido personalizado* — {PRECIO_PERSONALIZADO:.2f}€\n\n"
             "Cuéntanos qué quieres pedir y dónde (restaurante, tienda, plataforma...).",
             parse_mode="Markdown",
             reply_markup=cancelar_conv_keyboard()
