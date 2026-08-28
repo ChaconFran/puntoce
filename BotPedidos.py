@@ -3,6 +3,7 @@ import os
 import json
 import asyncio
 import urllib.request
+import urllib.error
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -243,17 +244,24 @@ def menu_principal():
         [InlineKeyboardButton("🎬 Cuentas", callback_data="cat_pantalones")],
         [InlineKeyboardButton("💰 Saldo", callback_data="cat_saldo")],
         [InlineKeyboardButton("📱 eSIM", callback_data="cat_target")],
-        [InlineKeyboardButton("🎯 Referidos", callback_data="cat_referidos")],
+        [InlineKeyboardButton("👤 Perfil", callback_data="cat_perfil")],
         [InlineKeyboardButton("🆘 Soporte", url=f"https://t.me/{CONTACTO_ADMIN}")],
     ])
 
-def teclado_referidos_menu():
+def teclado_perfil_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Mi progreso", callback_data="ref_progreso"),
-         InlineKeyboardButton("🔗 Mi enlace", callback_data="ref_enlace")],
+        [InlineKeyboardButton("📊 Estadísticas", callback_data="perfil_estadisticas")],
+        [InlineKeyboardButton("🎯 Referidos", callback_data="perfil_referidos")],
+        [InlineKeyboardButton("📦 Mis pedidos", callback_data="perfil_pedidos")],
+        [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
+    ])
+
+def teclado_referidos_submenu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Mi enlace", callback_data="ref_enlace")],
         [InlineKeyboardButton("✅ Verificar suscripción", callback_data="ref_verificar")],
         [InlineKeyboardButton("🏅 Ranking TOP", callback_data="ref_ranking")],
-        [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
+        [InlineKeyboardButton("🔙 Volver", callback_data="cat_perfil")],
     ])
 
 def teclado_pedidos_menu():
@@ -328,7 +336,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if uid not in referrer["referrals"]:
                 referrer["referrals"].append(uid)
             u_data["referred_by"] = referrer_id
-            bonus_msg = "\n\n👋 ¡Te han invitado! Ve a 🎯 *Referidos* → únete al canal y pulsa *Verificar suscripción* para que tu amigo reciba su XP."
+            bonus_msg = "\n\n👋 ¡Te han invitado! Ve a 👤 *Perfil → Referidos* → únete al canal y pulsa *Verificar suscripción* para que tu amigo reciba su XP."
 
     save_db(db)
     await update.message.reply_text(TEXTO_MENU + bonus_msg, parse_mode="Markdown", reply_markup=menu_principal())
@@ -338,8 +346,17 @@ async def volver_al_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await q.edit_message_text(TEXTO_MENU, parse_mode="Markdown", reply_markup=menu_principal())
 
-# ─── CATEGORÍA: REFERIDOS ──────────────────────────────────────────
-async def categoria_referidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─── CATEGORÍA: PERFIL (Estadísticas / Referidos / Mis pedidos) ────
+async def categoria_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "👤 *Perfil*\n\nElige una opción:",
+        parse_mode="Markdown",
+        reply_markup=teclado_perfil_menu()
+    )
+
+async def perfil_referidos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
@@ -347,7 +364,7 @@ async def categoria_referidos(update: Update, context: ContextTypes.DEFAULT_TYPE
         "Invita a tus amigos, sube de nivel y desbloquea descuentos en Zero Shop.\n\n"
         "Elige una opción:",
         parse_mode="Markdown",
-        reply_markup=teclado_referidos_menu()
+        reply_markup=teclado_referidos_submenu()
     )
 
 async def notificar_nuevos_premios(context, uid, u, nivel_anterior, nivel_nuevo, premios):
@@ -566,9 +583,63 @@ async def pago_transferencia_callback(update: Update, context: ContextTypes.DEFA
     except Exception as e:
         logging.error(f"No se pudo notificar la compra #{compra_id} al grupo: {e}")
 
+# ─── VERIFICACIÓN AUTOMÁTICA DEL HASH EN LA BLOCKCHAIN ────────────
+# Usa BlockCypher (API pública, sin necesidad de clave para este volumen).
+DECIMALES_CRYPTO = {"ltc": 1e8, "eth": 1e18}
+RED_BLOCKCYPHER = {"ltc": "ltc/main", "eth": "eth/main"}
+
+MIN_CONFIRMACIONES = 1          # confirmaciones mínimas en la blockchain para aceptar el pago
+TOLERANCIA_IMPORTE = 0.03       # 3% de margen por si la cotización se movió entre mostrarla y pagar
+
+def verificar_tx_blockchain(moneda, tx_hash):
+    """Consulta BlockCypher. Devuelve (encontrada, confirmaciones, importe_recibido_en_wallet)."""
+    red = RED_BLOCKCYPHER[moneda]
+    url = f"https://api.blockcypher.com/v1/{red}/txs/{tx_hash}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False, 0, 0.0
+        raise
+
+    confirmaciones = data.get("confirmations", 0)
+    direccion = WALLETS[moneda].lower()
+    total_unidades_base = 0
+    for salida in data.get("outputs", []):
+        direcciones_salida = [a.lower() for a in salida.get("addresses", [])]
+        if direccion in direcciones_salida:
+            total_unidades_base += salida.get("value", 0)
+
+    importe_recibido = total_unidades_base / DECIMALES_CRYPTO[moneda]
+    return True, confirmaciones, importe_recibido
+
+async def _confirmar_compra(context, db, compra_id, compra):
+    """Marca la compra como confirmada, otorga XP y hace la entrega automática si aplica.
+    Usada tanto por la verificación automática como por el botón manual del admin.
+    Devuelve (texto_extra_para_comprador, texto_extra_para_admin)."""
+    compra["estado"] = "confirmada"
+    comprador_id = str(compra["comprador_id"])
+    comprador = get_usuario(db, comprador_id)
+    await otorgar_xp_compra(context, comprador_id, comprador, compra["precio_eur"], get_premios(db))
+
+    extra_comprador = ""
+    extra_admin = ""
+    if compra.get("auto_entrega"):
+        id_producto = tomar_id_stock(compra["stock_file"])
+        if id_producto:
+            extra_comprador = f"\n\n🎟️ *Tu ID de producto:* `{id_producto}`"
+        else:
+            extra_comprador = "\n\n⚠️ Sin stock disponible ahora mismo. Te lo enviaremos en cuanto repongamos, disculpa la espera."
+            extra_admin = f"\n\n⚠️ *SIN STOCK* para reponer la compra #{compra_id} ({compra['producto']}). Revisa `{compra['stock_file']}`."
+
+    save_db(db)
+    return extra_comprador, extra_admin
+
 async def capturar_hash_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Captura el siguiente mensaje de texto del usuario como el hash de la transacción,
-    solo si estaba pendiente de enviarlo (fuera de esto, no hace nada)."""
+    solo si estaba pendiente de enviarlo (fuera de esto, no hace nada). Intenta verificarlo
+    automáticamente contra la blockchain; si no puede, cae al mismo flujo manual de siempre."""
     compra_id = context.user_data.get("compra_esperando_hash")
     if not compra_id:
         return
@@ -581,24 +652,70 @@ async def capturar_hash_pago(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     compra["hash"] = hash_tx
+    context.user_data.pop("compra_esperando_hash", None)
+    moneda = compra["metodo"]
+
+    await update.message.reply_text("🔍 Verificando el pago en la blockchain, un momento...")
+
+    verificado = False
+    motivo_fallo = ""
+    try:
+        encontrada, confirmaciones, importe_recibido = await asyncio.get_event_loop().run_in_executor(
+            None, verificar_tx_blockchain, moneda, hash_tx
+        )
+        cantidad_esperada = compra.get("cantidad_crypto", 0)
+        if not encontrada:
+            motivo_fallo = "No se encontró esa transacción en la blockchain."
+        elif confirmaciones < MIN_CONFIRMACIONES:
+            motivo_fallo = f"Solo tiene {confirmaciones} confirmación(es) (se requieren {MIN_CONFIRMACIONES})."
+        elif importe_recibido < cantidad_esperada * (1 - TOLERANCIA_IMPORTE):
+            motivo_fallo = f"El importe recibido ({importe_recibido:.8f} {moneda.upper()}) es menor al esperado ({cantidad_esperada:.8f})."
+        else:
+            verificado = True
+    except Exception as e:
+        motivo_fallo = f"Error al consultar la blockchain: {e}"
+
+    if verificado:
+        extra_comprador, extra_admin = await _confirmar_compra(context, db, compra_id, compra)
+        await update.message.reply_text(
+            f"✅ *Pago verificado automáticamente.* ¡Gracias!{extra_comprador}",
+            parse_mode="Markdown",
+            reply_markup=volver_menu_keyboard()
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=GRUPO_ADMIN_ID,
+                text=(
+                    f"✅ *PAGO VERIFICADO AUTOMÁTICAMENTE — Compra #{compra_id}*\n\n"
+                    f"Producto: {compra['producto']}\n"
+                    f"Importe: {compra['precio_eur']:.2f}€ ≈ {compra.get('cantidad_crypto', 0):.8f} {moneda.upper()}\n"
+                    f"Comprador: @{compra['username']} (ID `{compra['comprador_id']}`)\n"
+                    f"Hash: `{hash_tx}`" + extra_admin
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"No se pudo notificar la compra #{compra_id} al grupo: {e}")
+        return
+
+    # No se pudo verificar sola: cae al flujo manual de siempre
     compra["estado"] = "pendiente_verificacion"
     save_db(db)
-    context.user_data.pop("compra_esperando_hash", None)
-
     await update.message.reply_text(
-        "✅ Hash recibido. Estamos verificando el pago, te avisaremos en cuanto se confirme.",
+        "⏳ No hemos podido verificarlo automáticamente todavía (puede tardar unos minutos en "
+        "tener confirmaciones). Lo revisaremos manualmente en breve.",
         reply_markup=volver_menu_keyboard()
     )
-
     try:
         await context.bot.send_message(
             chat_id=GRUPO_ADMIN_ID,
             text=(
                 f"💰 *PAGO PENDIENTE DE VERIFICAR — Compra #{compra_id}*\n\n"
                 f"Producto: {compra['producto']}\n"
-                f"Importe: {compra['precio_eur']:.2f}€ ≈ {compra.get('cantidad_crypto', 0):.8f} {compra['metodo'].upper()}\n"
+                f"Importe: {compra['precio_eur']:.2f}€ ≈ {compra.get('cantidad_crypto', 0):.8f} {moneda.upper()}\n"
                 f"Comprador: @{compra['username']} (ID `{compra['comprador_id']}`)\n"
-                f"Hash: `{hash_tx}`"
+                f"Hash: `{hash_tx}`\n"
+                f"⚠️ Verificación automática: {motivo_fallo}"
             ),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirmar pago recibido", callback_data=f"compraconfirmar_{compra_id}")]])
@@ -607,7 +724,8 @@ async def capturar_hash_pago(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.error(f"No se pudo notificar la compra #{compra_id} al grupo: {e}")
 
 async def compra_confirmar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """El admin confirma en el grupo que el pago (cripto o transferencia) ha llegado."""
+    """El admin confirma manualmente en el grupo que el pago ha llegado
+    (red de seguridad para cuando la verificación automática no pudo confirmarlo)."""
     q = update.callback_query
     await q.answer()
     compra_id = q.data.split("_", 1)[1]
@@ -620,43 +738,25 @@ async def compra_confirmar_callback(update: Update, context: ContextTypes.DEFAUL
         await q.answer("Ya estaba confirmada.", show_alert=True)
         return
 
-    compra["estado"] = "confirmada"
-    comprador_id = str(compra["comprador_id"])
-    comprador = get_usuario(db, comprador_id)
-    await otorgar_xp_compra(context, comprador_id, comprador, compra["precio_eur"], get_premios(db))
+    extra_comprador, extra_admin = await _confirmar_compra(context, db, compra_id, compra)
 
-    # Entrega automática de stock (ej. productos CC) si el producto lo requiere.
-    mensaje_comprador = f"✅ Hemos confirmado tu pago de la compra *#{compra_id}* ({compra['producto']}). ¡Gracias!"
-    aviso_admin_extra = ""
-    if compra.get("auto_entrega"):
-        id_producto = tomar_id_stock(compra["stock_file"])
-        if id_producto:
-            mensaje_comprador += f"\n\n🎟️ *Tu ID de producto:* `{id_producto}`"
-        else:
-            mensaje_comprador += "\n\n⚠️ Sin stock disponible ahora mismo. Te lo enviaremos en cuanto repongamos, disculpa la espera."
-            aviso_admin_extra = f"\n\n⚠️ *SIN STOCK* para reponer la compra #{compra_id} ({compra['producto']}). Revisa `{compra['stock_file']}`."
-
-    save_db(db)
-
-    await q.edit_message_text(q.message.text_markdown + "\n\n✅ *PAGO CONFIRMADO*" + aviso_admin_extra, parse_mode="Markdown")
+    await q.edit_message_text(q.message.text_markdown + "\n\n✅ *PAGO CONFIRMADO*" + extra_admin, parse_mode="Markdown")
 
     try:
         await context.bot.send_message(
             chat_id=compra["comprador_id"],
-            text=mensaje_comprador,
+            text=f"✅ Hemos confirmado tu pago de la compra *#{compra_id}* ({compra['producto']}). ¡Gracias!" + extra_comprador,
             parse_mode="Markdown"
         )
     except Exception:
         pass
 
-async def ref_progreso_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def perfil_estadisticas_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
     uid = str(q.from_user.id)
     u = get_usuario(db, uid)
-    bot_user = await context.bot.get_me()
-    ref_link = f"https://t.me/{bot_user.username}?start={uid}"
 
     nivel, xp_en_nivel, xp_necesaria, pct = calcular_nivel(u["xp"])
     refs = len(u["referrals"])
@@ -674,7 +774,7 @@ async def ref_progreso_callback(update: Update, context: ContextTypes.DEFAULT_TY
     ) if premios else "Aún no hay premios configurados."
 
     texto = f"""
-📊 *TU PROGRESO*
+📊 *TUS ESTADÍSTICAS*
 
 👤 Usuario: @{u.get('username','?')}
 🏅 Nivel: *{nivel} / {NIVEL_MAX}*
@@ -686,13 +786,46 @@ async def ref_progreso_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 🏁 *Premios:*
 {premios_txt}
-
-🔗 Tu enlace:
-`{ref_link}`
 """
     await q.edit_message_text(
         texto, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="cat_referidos")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="cat_perfil")]])
+    )
+
+async def perfil_pedidos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    db = load_db()
+    uid = q.from_user.id
+
+    ESTADOS_COMPRA = {
+        "pendiente_metodo": "🕓 Pendiente de elegir método de pago",
+        "esperando_hash": "🕓 Esperando el pago",
+        "pendiente_verificacion": "🔍 Verificando el pago",
+        "pendiente_manual": "🏦 Pendiente de transferencia",
+        "confirmada": "✅ Confirmada",
+    }
+
+    lineas = []
+    pedidos_usuario = sorted(
+        ((int(n), p) for n, p in db["pedidos"].items() if p.get("usuario_id") == uid),
+        key=lambda x: x[0]
+    )
+    for numero, p in pedidos_usuario:
+        lineas.append(f"🍔 Pedido #{numero} — {p.get('restaurante_nombre', '?')} — {ESTADOS_PEDIDO.get(p['estado'], p['estado'])}")
+
+    compras_usuario = sorted(
+        ((int(n), c) for n, c in db["compras"].items() if c.get("comprador_id") == uid),
+        key=lambda x: x[0]
+    )
+    for numero, c in compras_usuario:
+        estado_txt = ESTADOS_COMPRA.get(c["estado"], c["estado"])
+        lineas.append(f"🛍️ Compra #{numero} — {c['producto']} ({c['precio_eur']:.2f}€) — {estado_txt}")
+
+    texto = "📦 *TUS PEDIDOS Y COMPRAS*\n\n" + "\n".join(lineas) if lineas else "📦 Aún no tienes ningún pedido ni compra."
+    await q.edit_message_text(
+        texto, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="cat_perfil")]])
     )
 
 async def ref_enlace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,7 +847,7 @@ Compártelo en grupos, canales y con amigos 👇
 """
     await q.edit_message_text(
         texto, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="cat_referidos")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="perfil_referidos")]])
     )
 
 async def ref_verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -752,7 +885,7 @@ async def ref_verificar_callback(update: Update, context: ContextTypes.DEFAULT_T
 """
     await q.edit_message_text(
         texto, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="cat_referidos")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="perfil_referidos")]])
     )
 
 async def ref_ranking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -769,7 +902,7 @@ async def ref_ranking_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     texto = "🏆 *TOP 10 PARTICIPANTES*\n\n" + "\n".join(lines) if lines else "🏆 Aún no hay participantes."
     await q.edit_message_text(
         texto, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="cat_referidos")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="perfil_referidos")]])
     )
 
 # ─── COMANDOS DE ADMINISTRACIÓN (gestión de premios y entregas) ───
@@ -1382,8 +1515,10 @@ def main():
     app.add_handler(CallbackQueryHandler(categoria_saldo, pattern="^cat_saldo$"))
     app.add_handler(CallbackQueryHandler(ver_producto_saldo, pattern="^saldo_"))
     app.add_handler(CallbackQueryHandler(categoria_target, pattern="^cat_target$"))
-    app.add_handler(CallbackQueryHandler(categoria_referidos, pattern="^cat_referidos$"))
-    app.add_handler(CallbackQueryHandler(ref_progreso_callback, pattern="^ref_progreso$"))
+    app.add_handler(CallbackQueryHandler(categoria_perfil, pattern="^cat_perfil$"))
+    app.add_handler(CallbackQueryHandler(perfil_estadisticas_callback, pattern="^perfil_estadisticas$"))
+    app.add_handler(CallbackQueryHandler(perfil_referidos_callback, pattern="^perfil_referidos$"))
+    app.add_handler(CallbackQueryHandler(perfil_pedidos_callback, pattern="^perfil_pedidos$"))
     app.add_handler(CallbackQueryHandler(ref_enlace_callback, pattern="^ref_enlace$"))
     app.add_handler(CallbackQueryHandler(ref_verificar_callback, pattern="^ref_verificar$"))
     app.add_handler(CallbackQueryHandler(ref_ranking_callback, pattern="^ref_ranking$"))
