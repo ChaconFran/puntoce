@@ -30,14 +30,14 @@ PLATAFORMAS = {
     "uber_glovo":  ("Uber Eats / Glovo",  "Comisión: 40% del carrito"),
 }
 
-# ─── PRODUCTOS: ROPA ───────────────────────────────────────────────
+# ─── PRODUCTOS: CCs ───────────────────────────────────────────────
 # clave -> (nombre, precio en €)
 ROPA = {
-    "camisetas": ("Camisetas", 5.0),
-    "pantalones": ("Pantalones", 8.0),
+    "camisetas": ("CC", 5.0),
+    "pantalones": ("CC FULLZ", 8.0),
 }
 
-# ─── PRODUCTOS: SALDO ──────────────────────────────────────────────
+# ─── PRODUCTOS: ONLYFANS  ──────────────────────────────────────────────
 # clave -> (texto a mostrar, precio en € o None si no tiene coste)
 SALDO = {
     "saldo_100": ("100€", 100.0),
@@ -817,7 +817,7 @@ async def ver_producto_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, nombre, precio)
     await iniciar_pago(q, context, compra_id, precio, nombre)
 
-# ─── CATEGORÍA: PANTALONES ──────────────────────────────────────────
+# ─── CATEGORÍA: NETFLIX/SPOTIFY… ──────────────────────────────────────────
 # 8 opciones numeradas, todas al mismo precio (da igual cuál se elija).
 NUM_PANTALONES = 8
 PRECIO_PANTALONES = 4.99
@@ -825,7 +825,7 @@ PRECIO_PANTALONES = 4.99
 def teclado_pantalones_menu():
     filas = [
         [InlineKeyboardButton(f"{i} — {PRECIO_PANTALONES:.2f}€", callback_data=f"pantalon_{i}")]
-        for i in range(1, NUM_PANTALONES + 1)
+        for i in range(1, NUM_PANTALONES + 1 )
     ]
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(filas)
@@ -877,7 +877,7 @@ async def ver_producto_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, f"Saldo {texto_opcion}", precio)
     await iniciar_pago(q, context, compra_id, precio, f"Saldo {texto_opcion}")
 
-# ─── CATEGORÍA: TARGET ──────────────────────────────────────────────
+# ─── CATEGORÍA: eSIMS ──────────────────────────────────────────────
 PRECIO_TARGET = 4.99
 
 async def categoria_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
