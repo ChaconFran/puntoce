@@ -11,7 +11,7 @@ from telegram.ext import (
 )
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────
-BOT_TOKEN = "8672882435:AAHECP0xEWorI9lQSc4R4JixIhnRXnzZ5j4"
+BOT_TOKEN = "8997518264:AAFPKhQaqZfT83JPN-KOoLiowqq0-yQTjTs"
 
 # ID del grupo de administradores donde llegan los pedidos.
 GRUPO_ADMIN_ID = -1004416626509
@@ -30,14 +30,14 @@ PLATAFORMAS = {
     "uber_glovo":  ("Uber Eats / Glovo",  "Comisión: 40% del carrito"),
 }
 
-# ─── PRODUCTOS: CCs ───────────────────────────────────────────────
+# ─── PRODUCTOS: ROPA ───────────────────────────────────────────────
 # clave -> (nombre, precio en €)
 ROPA = {
-    "camisetas": ("CC", 5.0),
-    "pantalones": ("CC FULLZ", 8.0),
+    "camisetas": ("Camisetas", 5.0),
+    "pantalones": ("Pantalones", 8.0),
 }
 
-# ─── PRODUCTOS: ONLYFANS  ──────────────────────────────────────────────
+# ─── PRODUCTOS: SALDO ──────────────────────────────────────────────
 # clave -> (texto a mostrar, precio en € o None si no tiene coste)
 SALDO = {
     "saldo_100": ("100€", 100.0),
@@ -204,10 +204,6 @@ ESTADOS_PEDIDO = {
 def menu_principal():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🍔 Pedidos a domicilio", callback_data="cat_pedidos")],
-        [InlineKeyboardButton("👕 Ropa", callback_data="cat_ropa")],
-        [InlineKeyboardButton("👖 Pantalones", callback_data="cat_pantalones")],
-        [InlineKeyboardButton("💰 Saldo", callback_data="cat_saldo")],
-        [InlineKeyboardButton("🏹 Target", callback_data="cat_target")],
         [InlineKeyboardButton("🎯 Referidos", callback_data="cat_referidos")],
         [InlineKeyboardButton("🆘 Soporte", url=f"https://t.me/{CONTACTO_ADMIN}")],
     ])
@@ -817,7 +813,7 @@ async def ver_producto_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, nombre, precio)
     await iniciar_pago(q, context, compra_id, precio, nombre)
 
-# ─── CATEGORÍA: NETFLIX/SPOTIFY… ──────────────────────────────────────────
+# ─── CATEGORÍA: PANTALONES ──────────────────────────────────────────
 # 8 opciones numeradas, todas al mismo precio (da igual cuál se elija).
 NUM_PANTALONES = 8
 PRECIO_PANTALONES = 4.99
@@ -825,7 +821,7 @@ PRECIO_PANTALONES = 4.99
 def teclado_pantalones_menu():
     filas = [
         [InlineKeyboardButton(f"{i} — {PRECIO_PANTALONES:.2f}€", callback_data=f"pantalon_{i}")]
-        for i in range(1, NUM_PANTALONES + 1 )
+        for i in range(1, NUM_PANTALONES + 1)
     ]
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(filas)
@@ -877,7 +873,7 @@ async def ver_producto_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, f"Saldo {texto_opcion}", precio)
     await iniciar_pago(q, context, compra_id, precio, f"Saldo {texto_opcion}")
 
-# ─── CATEGORÍA: eSIMS ──────────────────────────────────────────────
+# ─── CATEGORÍA: TARGET ──────────────────────────────────────────────
 PRECIO_TARGET = 4.99
 
 async def categoria_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
