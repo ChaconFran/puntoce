@@ -5,6 +5,7 @@ import asyncio
 import urllib.request
 import urllib.error
 from datetime import datetime
+from string import Template
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -255,6 +256,37 @@ def get_etiquetas(db):
     """Nombres actuales de las pestañas (por defecto + lo que se haya cambiado con /setnombre)."""
     return {**ETIQUETAS_DEFECTO, **db.get("_config", {}).get("etiquetas", {})}
 
+# Textos puramente visuales (cabeceras de cada sección, mensaje de bienvenida...).
+# Se pueden cambiar desde el propio bot con /settexto <clave> <texto nuevo>.
+# Los que llevan una variable la escriben como $variable (ej. $precio); si el
+# admin la borra o la escribe mal, simplemente no se sustituye, nunca rompe el bot.
+TEXTOS_DEFECTO = {
+    "bienvenida": (
+        "🛍️ *¡Bienvenido a Zero Shop!*\n\n"
+        "Bot para compras automáticas — por si quieres ser de los primeros en ser atendido.\n\n"
+        "Elige una categoría:"
+    ),
+    "titulo_pedidos":   "🍔 *Pedidos a domicilio*\n\nElige una opción:",
+    "titulo_cc":        "🧥 *CC — Cold Culture*\n\nElige una prenda:",
+    "titulo_cuentas":   "🎬 *Cuentas*\n\nTodas las opciones al mismo precio: *$precio€*.\n\nElige una:",
+    "titulo_saldo":     "💰 *Saldo*\n\nElige la cantidad:",
+    "titulo_perfil":    "👤 *Perfil*\n\nElige una opción:",
+    "titulo_referidos": (
+        "🎯 *Referidos*\n\n"
+        "Invita a tus amigos, sube de nivel y desbloquea descuentos en Zero Shop.\n\n"
+        "Elige una opción:"
+    ),
+}
+
+def get_texto(db, clave, **kwargs):
+    """Devuelve el texto configurado para esa clave (o el de fábrica), sustituyendo
+    las variables $nombre que tenga si se pasan por kwargs. Nunca lanza error aunque
+    falten o sobren variables."""
+    plantilla = db.get("_config", {}).get("textos", {}).get(clave, TEXTOS_DEFECTO.get(clave, ""))
+    if kwargs:
+        return Template(plantilla).safe_substitute(**kwargs)
+    return plantilla
+
 def menu_principal():
     db = load_db()
     et = get_etiquetas(db)
@@ -336,12 +368,6 @@ def teclado_admin(numero):
     ])
 
 # ─── MENÚ PRINCIPAL ────────────────────────────────────────────────
-TEXTO_MENU = (
-    "🛍️ *¡Bienvenido a Zero Shop!*\n\n"
-    "Bot para compras automáticas — por si quieres ser de los primeros en ser atendido.\n\n"
-    "Elige una categoría:"
-)
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db = load_db()
@@ -360,19 +386,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bonus_msg = "\n\n👋 ¡Te han invitado! Ve a 👤 *Perfil → Referidos* → únete al canal y pulsa *Verificar suscripción* para que tu amigo reciba su XP."
 
     save_db(db)
-    await update.message.reply_text(TEXTO_MENU + bonus_msg, parse_mode="Markdown", reply_markup=menu_principal())
+    await update.message.reply_text(get_texto(db, "bienvenida") + bonus_msg, parse_mode="Markdown", reply_markup=menu_principal())
 
 async def volver_al_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(TEXTO_MENU, parse_mode="Markdown", reply_markup=menu_principal())
+    db = load_db()
+    await q.edit_message_text(get_texto(db, "bienvenida"), parse_mode="Markdown", reply_markup=menu_principal())
 
 # ─── CATEGORÍA: PERFIL (Estadísticas / Referidos / Mis pedidos) ────
 async def categoria_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    db = load_db()
     await q.edit_message_text(
-        "👤 *Perfil*\n\nElige una opción:",
+        get_texto(db, "titulo_perfil"),
         parse_mode="Markdown",
         reply_markup=teclado_perfil_menu()
     )
@@ -380,10 +408,9 @@ async def categoria_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def perfil_referidos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    db = load_db()
     await q.edit_message_text(
-        "🎯 *Referidos*\n\n"
-        "Invita a tus amigos, sube de nivel y desbloquea descuentos en Zero Shop.\n\n"
-        "Elige una opción:",
+        get_texto(db, "titulo_referidos"),
         parse_mode="Markdown",
         reply_markup=teclado_referidos_submenu()
     )
@@ -1282,6 +1309,65 @@ async def cmd_resetnombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_db(db)
     await update.message.reply_text(f"✅ Pestaña «{clave}» devuelta a su nombre original: {ETIQUETAS_DEFECTO[clave]}")
 
+# ─── COMANDOS DE ADMINISTRACIÓN: TEXTOS VISUALES ───────────────────
+async def cmd_textos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista las claves de cada texto visual y su contenido actual."""
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    lineas = []
+    for clave in TEXTOS_DEFECTO:
+        actual = get_texto(db, clave)
+        resumen = actual.replace("\n", " ")[:60] + ("..." if len(actual) > 60 else "")
+        lineas.append(f"`{clave}` → {resumen}")
+    await update.message.reply_text(
+        "📝 *Textos visuales configurables:*\n\n" + "\n".join(lineas) +
+        "\n\nCambia uno con /settexto <clave> <texto nuevo>\n"
+        "El de «titulo_cuentas» admite la variable $precio (no la borres si la usas).",
+        parse_mode="Markdown"
+    )
+
+async def cmd_settexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cambia un texto visual. Uso: /settexto <clave> <texto nuevo> (admite varias líneas)."""
+    if not es_admin(update.effective_user.id):
+        return
+    partes = update.message.text.split(" ", 2)
+    if len(partes) < 3 or not partes[2].strip():
+        await update.message.reply_text(
+            "Uso: /settexto <clave> <texto nuevo>\n"
+            "Usa /textos para ver las claves disponibles."
+        )
+        return
+    clave = partes[1]
+    if clave not in TEXTOS_DEFECTO:
+        await update.message.reply_text(
+            "Esa clave no existe. Claves disponibles: " + ", ".join(TEXTOS_DEFECTO.keys())
+        )
+        return
+    nuevo_texto = partes[2]
+    db = load_db()
+    db.setdefault("_config", {}).setdefault("textos", {})[clave] = nuevo_texto
+    save_db(db)
+    await update.message.reply_text(f"✅ Texto «{clave}» actualizado.")
+
+async def cmd_resettexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Devuelve un texto visual a su versión original. Uso: /resettexto <clave>"""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /resettexto <clave>\nUsa /textos para ver las claves disponibles.")
+        return
+    clave = context.args[0]
+    if clave not in TEXTOS_DEFECTO:
+        await update.message.reply_text(
+            "Esa clave no existe. Claves disponibles: " + ", ".join(TEXTOS_DEFECTO.keys())
+        )
+        return
+    db = load_db()
+    db.setdefault("_config", {}).setdefault("textos", {}).pop(clave, None)
+    save_db(db)
+    await update.message.reply_text(f"✅ Texto «{clave}» devuelto a su versión original.")
+
 # ─── COMANDOS DE ADMINISTRACIÓN: ESTADÍSTICAS Y AVISOS ─────────────
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_admin(update.effective_user.id):
@@ -1434,6 +1520,11 @@ async def cmd_adminayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /nombres — ver las claves y el nombre actual de cada pestaña
 /setnombre <clave> <texto nuevo> — renombrar una pestaña
 /resetnombre <clave> — devolverla a su nombre original
+
+*Textos visuales (cabeceras, bienvenida...)*
+/textos — ver las claves y el texto actual de cada una
+/settexto <clave> <texto nuevo> — cambiar un texto
+/resettexto <clave> — devolverlo a su versión original
 """
     await update.message.reply_text(texto, parse_mode="Markdown")
 
@@ -1441,8 +1532,9 @@ async def cmd_adminayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def categoria_pedidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    db = load_db()
     await q.edit_message_text(
-        "🍔 *Pedidos a domicilio*\n\nElige una opción:",
+        get_texto(db, "titulo_pedidos"),
         parse_mode="Markdown",
         reply_markup=teclado_pedidos_menu()
     )
@@ -1451,8 +1543,9 @@ async def categoria_pedidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def categoria_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    db = load_db()
     await q.edit_message_text(
-        "🧥 *CC — Cold Culture*\n\nElige una prenda:",
+        get_texto(db, "titulo_cc"),
         parse_mode="Markdown",
         reply_markup=teclado_ropa_menu()
     )
@@ -1485,8 +1578,9 @@ def teclado_pantalones_menu():
 async def categoria_pantalones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    db = load_db()
     await q.edit_message_text(
-        f"🎬 *Cuentas*\n\nTodas las opciones al mismo precio: *{PRECIO_PANTALONES:.2f}€*.\n\nElige una:",
+        get_texto(db, "titulo_cuentas", precio=f"{PRECIO_PANTALONES:.2f}"),
         parse_mode="Markdown",
         reply_markup=teclado_pantalones_menu()
     )
@@ -1506,8 +1600,9 @@ async def ver_pantalon_numero(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def categoria_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    db = load_db()
     await q.edit_message_text(
-        "💰 *Saldo*\n\nElige la cantidad:",
+        get_texto(db, "titulo_saldo"),
         parse_mode="Markdown",
         reply_markup=teclado_saldo_menu()
     )
@@ -1905,7 +2000,8 @@ async def cancelar_conv_callback(update: Update, context: ContextTypes.DEFAULT_T
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
-    await q.edit_message_text(TEXTO_MENU, parse_mode="Markdown", reply_markup=menu_principal())
+    db = load_db()
+    await q.edit_message_text(get_texto(db, "bienvenida"), parse_mode="Markdown", reply_markup=menu_principal())
     return ConversationHandler.END
 
 # ─── CONFIRMACIÓN Y ENVÍO AL GRUPO DE ADMINS ──────────────────────
@@ -2098,6 +2194,9 @@ def main():
     app.add_handler(CommandHandler("nombres", cmd_nombres))
     app.add_handler(CommandHandler("setnombre", cmd_setnombre))
     app.add_handler(CommandHandler("resetnombre", cmd_resetnombre))
+    app.add_handler(CommandHandler("textos", cmd_textos))
+    app.add_handler(CommandHandler("settexto", cmd_settexto))
+    app.add_handler(CommandHandler("resettexto", cmd_resettexto))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("cancelarpedido", cmd_cancelarpedido))
