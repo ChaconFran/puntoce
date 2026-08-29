@@ -238,16 +238,35 @@ ESTADOS_PEDIDO = {
 }
 
 # ─── TECLADOS ─────────────────────────────────────────────────────
+# Nombres visibles de las pestañas del menú principal. Se pueden cambiar
+# desde el propio bot con /setnombre <clave> <texto nuevo>, sin tocar código.
+ETIQUETAS_DEFECTO = {
+    "perfil":   "👤 Perfil",
+    "pedidos":  "🍔 Pedidos a domicilio",
+    "cc":       "🧥 CC",
+    "cuentas":  "🎬 Cuentas",
+    "saldo":    "💰 Saldo",
+    "esim":     "📱 eSIM",
+    "regalos":  "🎁 Regalos Aleatorios",
+    "soporte":  "🆘 Soporte",
+}
+
+def get_etiquetas(db):
+    """Nombres actuales de las pestañas (por defecto + lo que se haya cambiado con /setnombre)."""
+    return {**ETIQUETAS_DEFECTO, **db.get("_config", {}).get("etiquetas", {})}
+
 def menu_principal():
+    db = load_db()
+    et = get_etiquetas(db)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Perfil", callback_data="cat_perfil")],
-        [InlineKeyboardButton("🍔 Pedidos a domicilio", callback_data="cat_pedidos")],
-        [InlineKeyboardButton("🧥 CC", callback_data="cat_ropa")],
-        [InlineKeyboardButton("🎬 Cuentas", callback_data="cat_pantalones")],
-        [InlineKeyboardButton("💰 Saldo", callback_data="cat_saldo")],
-        [InlineKeyboardButton("📱 eSIM", callback_data="cat_target")],
-        [InlineKeyboardButton("🎁 Regalos Aleatorios", callback_data="cat_regalo")],
-        [InlineKeyboardButton("🆘 Soporte", url=f"https://t.me/{CONTACTO_ADMIN}")],
+        [InlineKeyboardButton(et["perfil"], callback_data="cat_perfil")],
+        [InlineKeyboardButton(et["pedidos"], callback_data="cat_pedidos")],
+        [InlineKeyboardButton(et["cc"], callback_data="cat_ropa")],
+        [InlineKeyboardButton(et["cuentas"], callback_data="cat_pantalones")],
+        [InlineKeyboardButton(et["saldo"], callback_data="cat_saldo")],
+        [InlineKeyboardButton(et["esim"], callback_data="cat_target")],
+        [InlineKeyboardButton(et["regalos"], callback_data="cat_regalo")],
+        [InlineKeyboardButton(et["soporte"], url=f"https://t.me/{CONTACTO_ADMIN}")],
     ])
 
 def teclado_perfil_menu():
@@ -1207,6 +1226,62 @@ async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lineas = [f"`{i}` (fijo en el código)" for i in ADMIN_IDS] + [f"`{i}` (añadido por comando)" for i in extra]
     await update.message.reply_text("👮 *Administradores actuales:*\n\n" + "\n".join(lineas), parse_mode="Markdown")
 
+# ─── COMANDOS DE ADMINISTRACIÓN: NOMBRES DE LAS PESTAÑAS ───────────
+async def cmd_nombres(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista las claves de cada pestaña y su nombre visible actual."""
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    et = get_etiquetas(db)
+    lineas = [f"`{clave}` → {texto}" for clave, texto in et.items()]
+    await update.message.reply_text(
+        "🏷️ *Pestañas del menú principal:*\n\n" + "\n".join(lineas) +
+        "\n\nCambia una con /setnombre <clave> <texto nuevo>\n"
+        "Ej: /setnombre saldo 💎 OF Balance",
+        parse_mode="Markdown"
+    )
+
+async def cmd_setnombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cambia el nombre visible de una pestaña. Uso: /setnombre <clave> <texto nuevo>"""
+    if not es_admin(update.effective_user.id):
+        return
+    partes = update.message.text.split(" ", 2)
+    if len(partes) < 3 or not partes[2].strip():
+        await update.message.reply_text(
+            "Uso: /setnombre <clave> <texto nuevo>\n"
+            "Usa /nombres para ver las claves disponibles."
+        )
+        return
+    clave = partes[1]
+    if clave not in ETIQUETAS_DEFECTO:
+        await update.message.reply_text(
+            "Esa clave no existe. Claves disponibles: " + ", ".join(ETIQUETAS_DEFECTO.keys())
+        )
+        return
+    nuevo_texto = partes[2]
+    db = load_db()
+    db.setdefault("_config", {}).setdefault("etiquetas", {})[clave] = nuevo_texto
+    save_db(db)
+    await update.message.reply_text(f"✅ Pestaña «{clave}» renombrada a: {nuevo_texto}")
+
+async def cmd_resetnombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Devuelve una pestaña a su nombre original. Uso: /resetnombre <clave>"""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /resetnombre <clave>\nUsa /nombres para ver las claves disponibles.")
+        return
+    clave = context.args[0]
+    if clave not in ETIQUETAS_DEFECTO:
+        await update.message.reply_text(
+            "Esa clave no existe. Claves disponibles: " + ", ".join(ETIQUETAS_DEFECTO.keys())
+        )
+        return
+    db = load_db()
+    db.setdefault("_config", {}).setdefault("etiquetas", {}).pop(clave, None)
+    save_db(db)
+    await update.message.reply_text(f"✅ Pestaña «{clave}» devuelta a su nombre original: {ETIQUETAS_DEFECTO[clave]}")
+
 # ─── COMANDOS DE ADMINISTRACIÓN: ESTADÍSTICAS Y AVISOS ─────────────
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_admin(update.effective_user.id):
@@ -1348,12 +1423,17 @@ async def cmd_adminayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *General*
 /stats — estadísticas globales del bot
 /broadcast <mensaje> — enviar un aviso a todos los usuarios
-/resetxp <ID_usuario> — reiniciar el nivel/XP de un usuario
+/resetxp <ID usuario> — reiniciar el nivel/XP de un usuario
 
 *Administradores*
 /admins — ver quién es admin
 /addadmin <ID> — añadir un admin
 /deladmin <ID> — quitar un admin (solo los añadidos por comando)
+
+*Nombres de las pestañas*
+/nombres — ver las claves y el nombre actual de cada pestaña
+/setnombre <clave> <texto nuevo> — renombrar una pestaña
+/resetnombre <clave> — devolverla a su nombre original
 """
     await update.message.reply_text(texto, parse_mode="Markdown")
 
@@ -2015,6 +2095,9 @@ def main():
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("deladmin", cmd_deladmin))
     app.add_handler(CommandHandler("admins", cmd_admins))
+    app.add_handler(CommandHandler("nombres", cmd_nombres))
+    app.add_handler(CommandHandler("setnombre", cmd_setnombre))
+    app.add_handler(CommandHandler("resetnombre", cmd_resetnombre))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("cancelarpedido", cmd_cancelarpedido))
