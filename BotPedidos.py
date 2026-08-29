@@ -1395,10 +1395,12 @@ NUM_PANTALONES = 8
 PRECIO_PANTALONES = 4.99
 
 def teclado_pantalones_menu():
+    ETIQUETAS = ["NETFLIX", "SPOTIFY", "HBO", "PRIME VIDEO", "APPLE TV", "DAZN", "ESPN", "DISNEY+"]  # una por cada opción (debe tener NUM_PANTALONES elementos)
     filas = [
-        [InlineKeyboardButton(f"{i} — {PRECIO_PANTALONES:.2f}€", callback_data=f"pantalon_{i}")]
+        [InlineKeyboardButton(f"{ETIQUETAS[i-1]} — {PRECIO_PANTALONES:.2f}€", callback_data=f"pantalon_{i}")]
         for i in range(1, NUM_PANTALONES + 1)
     ]
+
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(filas)
 
