@@ -1,4 +1,4 @@
-##import logging
+import logging
 import os
 import json
 import asyncio
@@ -242,9 +242,9 @@ def menu_principal():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Perfil", callback_data="cat_perfil")],
         [InlineKeyboardButton("🍔 Pedidos a domicilio", callback_data="cat_pedidos")],
-        [InlineKeyboardButton("💳 CCs FRESH", callback_data="cat_ropa")],
+        [InlineKeyboardButton("🧥 CC", callback_data="cat_ropa")],
         [InlineKeyboardButton("🎬 Cuentas", callback_data="cat_pantalones")],
-        [InlineKeyboardButton("🔵 ONLYFANS", callback_data="cat_saldo")],
+        [InlineKeyboardButton("💰 Saldo", callback_data="cat_saldo")],
         [InlineKeyboardButton("📱 eSIM", callback_data="cat_target")],
         [InlineKeyboardButton("🎁 Regalos Aleatorios", callback_data="cat_regalo")],
         [InlineKeyboardButton("🆘 Soporte", url=f"https://t.me/{CONTACTO_ADMIN}")],
@@ -1372,7 +1372,7 @@ async def categoria_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        "🧥 *CCs FRESH*\n\nElige CVR:",
+        "🧥 *CC — Cold Culture*\n\nElige una prenda:",
         parse_mode="Markdown",
         reply_markup=teclado_ropa_menu()
     )
@@ -1395,12 +1395,10 @@ NUM_PANTALONES = 8
 PRECIO_PANTALONES = 4.99
 
 def teclado_pantalones_menu():
-    ETIQUETAS = ["NETFLIX", "SPOTIFY", "HBO", "PRIME VIDEO", "APPLE TV", "DAZN", "ESPN", "DISNEY+"]  # una por cada opción (debe tener NUM_PANTALONES elementos)
     filas = [
-        [InlineKeyboardButton(f"{ETIQUETAS[i-1]} — {PRECIO_PANTALONES:.2f}€", callback_data=f"pantalon_{i}")]
+        [InlineKeyboardButton(f"{i} — {PRECIO_PANTALONES:.2f}€", callback_data=f"pantalon_{i}")]
         for i in range(1, NUM_PANTALONES + 1)
     ]
-
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(filas)
 
