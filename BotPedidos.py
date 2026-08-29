@@ -1,4 +1,4 @@
-import logging
+##import logging
 import os
 import json
 import asyncio
@@ -1372,7 +1372,7 @@ async def categoria_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        "🧥 *CC — Cold Culture*\n\nElige una prenda:",
+        "🧥 *CCs FRESH*\n\nElige CVR:",
         parse_mode="Markdown",
         reply_markup=teclado_ropa_menu()
     )
