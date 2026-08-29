@@ -242,9 +242,9 @@ def menu_principal():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Perfil", callback_data="cat_perfil")],
         [InlineKeyboardButton("🍔 Pedidos a domicilio", callback_data="cat_pedidos")],
-        [InlineKeyboardButton("🧥 CC", callback_data="cat_ropa")],
+        [InlineKeyboardButton("💳 CCs FRESH", callback_data="cat_ropa")],
         [InlineKeyboardButton("🎬 Cuentas", callback_data="cat_pantalones")],
-        [InlineKeyboardButton("💰 Saldo", callback_data="cat_saldo")],
+        [InlineKeyboardButton("🔵 ONLYFANS", callback_data="cat_saldo")],
         [InlineKeyboardButton("📱 eSIM", callback_data="cat_target")],
         [InlineKeyboardButton("🎁 Regalos Aleatorios", callback_data="cat_regalo")],
         [InlineKeyboardButton("🆘 Soporte", url=f"https://t.me/{CONTACTO_ADMIN}")],
