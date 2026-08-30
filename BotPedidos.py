@@ -287,6 +287,18 @@ def get_texto(db, clave, **kwargs):
         return Template(plantilla).safe_substitute(**kwargs)
     return plantilla
 
+# Nombres de las "sub-pestañas" dentro de cada categoría (ej. los botones de
+# Saldo, las prendas de CC, los restaurantes de Pedidos...). Se identifican por
+# "categoria:clave" y se editan con /setsubnombre <categoria> <clave> <texto>.
+def get_subetiqueta(db, categoria, clave, default):
+    return db.get("_config", {}).get("sub_etiquetas", {}).get(f"{categoria}:{clave}", default)
+
+def set_subetiqueta(db, categoria, clave, texto):
+    db.setdefault("_config", {}).setdefault("sub_etiquetas", {})[f"{categoria}:{clave}"] = texto
+
+def reset_subetiqueta(db, categoria, clave):
+    db.setdefault("_config", {}).setdefault("sub_etiquetas", {}).pop(f"{categoria}:{clave}", None)
+
 def menu_principal():
     db = load_db()
     et = get_etiquetas(db)
@@ -324,18 +336,18 @@ def teclado_pedidos_menu():
         [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
     ])
 
-def teclado_ropa_menu():
+def teclado_ropa_menu(db):
     filas = [
-        [InlineKeyboardButton(f"{nombre} — {precio:.0f}€", callback_data=f"ropa_{clave}")]
+        [InlineKeyboardButton(f"{get_subetiqueta(db, 'cc', clave, nombre)} — {precio:.0f}€", callback_data=f"ropa_{clave}")]
         for clave, (nombre, precio, _stock) in ROPA.items()
     ]
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(filas)
 
-def teclado_saldo_menu():
+def teclado_saldo_menu(db):
     filas = [
-        [InlineKeyboardButton(texto, callback_data=f"{clave}")]
-        for clave, (texto, _precio) in SALDO.items()
+        [InlineKeyboardButton(get_subetiqueta(db, "saldo", clave, texto_defecto), callback_data=f"{clave}")]
+        for clave, (texto_defecto, _precio) in SALDO.items()
     ]
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(filas)
@@ -346,13 +358,13 @@ def volver_menu_keyboard():
 def cancelar_conv_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar pedido", callback_data="cancelar_conv")]])
 
-def teclado_restaurantes():
+def teclado_restaurantes(db):
     filas = [
-        [InlineKeyboardButton(f"{nombre} — {precio:.2f}€", callback_data=f"restaurante_{clave}")]
+        [InlineKeyboardButton(f"{get_subetiqueta(db, 'pedidos', clave, nombre)} — {precio:.2f}€", callback_data=f"restaurante_{clave}")]
         for clave, (nombre, precio) in PLATAFORMAS.items()
     ]
     filas += [
-        [InlineKeyboardButton(f"{nombre} — {precio:.2f}€", callback_data=f"evento_{clave}")]
+        [InlineKeyboardButton(f"{get_subetiqueta(db, 'pedidos', clave, nombre)} — {precio:.2f}€", callback_data=f"evento_{clave}")]
         for clave, (nombre, precio, _pregunta) in EVENTOS.items()
     ]
     filas.append([InlineKeyboardButton("✏️ Pedido personalizado", callback_data="restaurante_personalizado")])
@@ -1180,7 +1192,7 @@ async def cmd_verregalos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resumen = g["texto"][:40] + ("..." if len(g["texto"]) > 40 else "")
         imagen_txt = "📷" if g.get("imagen_file_id") else "sin imagen"
         lineas.append(f"#{g['id']}: {resumen} — {g['cupo_restante']}/{g['cupo_total']} — {imagen_txt}")
-    await update.message.reply_text("🎁 *Regalos configurados:*\n\n" + "\n".join(lineas), parse_mode="Markdown")
+    await update.message.reply_text("🎁 Regalos configurados:\n\n" + "\n".join(lineas))
 
 async def capturar_imagen_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Si un admin pidió /imagenregalo <id>, la siguiente foto que mande se asigna a ese regalo."""
@@ -1260,12 +1272,13 @@ async def cmd_nombres(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db = load_db()
     et = get_etiquetas(db)
-    lineas = [f"`{clave}` → {texto}" for clave, texto in et.items()]
+    lineas = [f"{clave} → {texto}" for clave, texto in et.items()]
+    # Sin parse_mode: los nombres los puede editar el admin libremente, y si alguno
+    # queda con un * o _ suelto, con Markdown el mensaje entero dejaría de enviarse.
     await update.message.reply_text(
-        "🏷️ *Pestañas del menú principal:*\n\n" + "\n".join(lineas) +
+        "🏷️ Pestañas del menú principal:\n\n" + "\n".join(lineas) +
         "\n\nCambia una con /setnombre <clave> <texto nuevo>\n"
-        "Ej: /setnombre saldo 💎 OF Balance",
-        parse_mode="Markdown"
+        "Ej: /setnombre saldo 💎 OF Balance"
     )
 
 async def cmd_setnombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1319,12 +1332,15 @@ async def cmd_textos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for clave in TEXTOS_DEFECTO:
         actual = get_texto(db, clave)
         resumen = actual.replace("\n", " ")[:60] + ("..." if len(actual) > 60 else "")
-        lineas.append(f"`{clave}` → {resumen}")
+        lineas.append(f"{clave} → {resumen}")
+    # Sin parse_mode a propósito: el resumen recorta el texto a 60 caracteres y, si
+    # el corte cae en mitad de un *negrita* o _cursiva_, Telegram rechaza el mensaje
+    # entero (el mismo problema que rompía /adminayuda). Al no usar Markdown aquí,
+    # esto no puede volver a pasar por mucho que se edite el contenido.
     await update.message.reply_text(
-        "📝 *Textos visuales configurables:*\n\n" + "\n".join(lineas) +
+        "📝 Textos visuales configurables:\n\n" + "\n".join(lineas) +
         "\n\nCambia uno con /settexto <clave> <texto nuevo>\n"
-        "El de «titulo_cuentas» admite la variable $precio (no la borres si la usas).",
-        parse_mode="Markdown"
+        "El de «titulo_cuentas» admite la variable $precio (no la borres si la usas)."
     )
 
 async def cmd_settexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1367,6 +1383,92 @@ async def cmd_resettexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.setdefault("_config", {}).setdefault("textos", {}).pop(clave, None)
     save_db(db)
     await update.message.reply_text(f"✅ Texto «{clave}» devuelto a su versión original.")
+
+# ─── COMANDOS DE ADMINISTRACIÓN: SUB-PESTAÑAS (botones dentro de cada categoría) ─
+def _claves_validas_por_categoria(categoria):
+    """Devuelve el conjunto de claves válidas y el nombre por defecto de cada una,
+    según la categoría, para poder validar /setsubnombre."""
+    if categoria == "saldo":
+        return {clave: texto for clave, (texto, _p) in SALDO.items()}
+    if categoria == "cc":
+        return {clave: nombre for clave, (nombre, _p, _s) in ROPA.items()}
+    if categoria == "cuentas":
+        return {str(i): str(i) for i in range(1, NUM_PANTALONES + 1)}
+    if categoria == "pedidos":
+        d = {clave: nombre for clave, (nombre, _p) in PLATAFORMAS.items()}
+        d.update({clave: nombre for clave, (nombre, _p, _pr) in EVENTOS.items()})
+        return d
+    return None
+
+async def cmd_subnombres(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista las sub-pestañas (botones dentro de una categoría) y su nombre actual.
+    Uso: /subnombres <categoria>  (categorías: saldo, cc, cuentas, pedidos)"""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Uso: /subnombres <categoria>\nCategorías disponibles: saldo, cc, cuentas, pedidos"
+        )
+        return
+    categoria = context.args[0]
+    defectos = _claves_validas_por_categoria(categoria)
+    if defectos is None:
+        await update.message.reply_text("Categoría no reconocida. Usa: saldo, cc, cuentas o pedidos.")
+        return
+    db = load_db()
+    lineas = [f"{clave} → {get_subetiqueta(db, categoria, clave, defecto)}" for clave, defecto in defectos.items()]
+    await update.message.reply_text(
+        f"🏷️ Sub-pestañas de «{categoria}»:\n\n" + "\n".join(lineas) +
+        f"\n\nCambia una con /setsubnombre {categoria} <clave> <texto nuevo>"
+    )
+
+async def cmd_setsubnombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cambia el nombre de una sub-pestaña. Uso: /setsubnombre <categoria> <clave> <texto nuevo>"""
+    if not es_admin(update.effective_user.id):
+        return
+    partes = update.message.text.split(" ", 3)
+    if len(partes) < 4 or not partes[3].strip():
+        await update.message.reply_text(
+            "Uso: /setsubnombre <categoria> <clave> <texto nuevo>\n"
+            "Usa /subnombres <categoria> para ver las claves disponibles."
+        )
+        return
+    categoria, clave, nuevo_texto = partes[1], partes[2], partes[3]
+    defectos = _claves_validas_por_categoria(categoria)
+    if defectos is None:
+        await update.message.reply_text("Categoría no reconocida. Usa: saldo, cc, cuentas o pedidos.")
+        return
+    if clave not in defectos:
+        await update.message.reply_text(
+            f"Esa clave no existe en «{categoria}». Claves disponibles: " + ", ".join(defectos.keys())
+        )
+        return
+    db = load_db()
+    set_subetiqueta(db, categoria, clave, nuevo_texto)
+    save_db(db)
+    await update.message.reply_text(f"✅ «{categoria}:{clave}» renombrado a: {nuevo_texto}")
+
+async def cmd_resetsubnombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Devuelve una sub-pestaña a su nombre original. Uso: /resetsubnombre <categoria> <clave>"""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Uso: /resetsubnombre <categoria> <clave>")
+        return
+    categoria, clave = context.args
+    defectos = _claves_validas_por_categoria(categoria)
+    if defectos is None:
+        await update.message.reply_text("Categoría no reconocida. Usa: saldo, cc, cuentas o pedidos.")
+        return
+    if clave not in defectos:
+        await update.message.reply_text(
+            f"Esa clave no existe en «{categoria}». Claves disponibles: " + ", ".join(defectos.keys())
+        )
+        return
+    db = load_db()
+    reset_subetiqueta(db, categoria, clave)
+    save_db(db)
+    await update.message.reply_text(f"✅ «{categoria}:{clave}» devuelto a su nombre original: {defectos[clave]}")
 
 # ─── COMANDOS DE ADMINISTRACIÓN: ESTADÍSTICAS Y AVISOS ─────────────
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1525,6 +1627,11 @@ async def cmd_adminayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /textos — ver las claves y el texto actual de cada una
 /settexto <clave> <texto nuevo> — cambiar un texto
 /resettexto <clave> — devolverlo a su versión original
+
+*Sub-pestañas (botones dentro de cada categoría)*
+/subnombres <categoria> — ver claves y nombres (saldo, cc, cuentas, pedidos)
+/setsubnombre <categoria> <clave> <texto nuevo> — renombrar una
+/resetsubnombre <categoria> <clave> — devolverla a su nombre original
 """
     await update.message.reply_text(texto, parse_mode="Markdown")
 
@@ -1547,15 +1654,16 @@ async def categoria_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         get_texto(db, "titulo_cc"),
         parse_mode="Markdown",
-        reply_markup=teclado_ropa_menu()
+        reply_markup=teclado_ropa_menu(db)
     )
 
 async def ver_producto_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     clave = q.data.split("_", 1)[1]
-    nombre, precio, stock_file = ROPA[clave]
+    nombre_defecto, precio, stock_file = ROPA[clave]
     db = load_db()
+    nombre = get_subetiqueta(db, "cc", clave, nombre_defecto)
     compra_id = crear_compra(
         db, q.from_user.id, q.from_user.username or q.from_user.first_name,
         nombre, precio, auto_entrega=True, stock_file=stock_file
@@ -1567,9 +1675,12 @@ async def ver_producto_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 NUM_PANTALONES = 8
 PRECIO_PANTALONES = 4.99
 
-def teclado_pantalones_menu():
+def teclado_pantalones_menu(db):
     filas = [
-        [InlineKeyboardButton(f"{i} — {PRECIO_PANTALONES:.2f}€", callback_data=f"pantalon_{i}")]
+        [InlineKeyboardButton(
+            f"{get_subetiqueta(db, 'cuentas', str(i), str(i))} — {PRECIO_PANTALONES:.2f}€",
+            callback_data=f"pantalon_{i}"
+        )]
         for i in range(1, NUM_PANTALONES + 1)
     ]
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
@@ -1582,7 +1693,7 @@ async def categoria_pantalones(update: Update, context: ContextTypes.DEFAULT_TYP
     await q.edit_message_text(
         get_texto(db, "titulo_cuentas", precio=f"{PRECIO_PANTALONES:.2f}"),
         parse_mode="Markdown",
-        reply_markup=teclado_pantalones_menu()
+        reply_markup=teclado_pantalones_menu(db)
     )
 
 async def ver_pantalon_numero(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1590,11 +1701,12 @@ async def ver_pantalon_numero(update: Update, context: ContextTypes.DEFAULT_TYPE
     await q.answer()
     numero = q.data.split("_", 1)[1]
     db = load_db()
+    etiqueta = get_subetiqueta(db, "cuentas", numero, numero)
     compra_id = crear_compra(
         db, q.from_user.id, q.from_user.username or q.from_user.first_name,
-        f"Pantalones (opción {numero})", PRECIO_PANTALONES
+        f"Cuentas (opción {etiqueta})", PRECIO_PANTALONES
     )
-    await iniciar_pago(q, context, compra_id, PRECIO_PANTALONES, f"Pantalones (opción {numero})")
+    await iniciar_pago(q, context, compra_id, PRECIO_PANTALONES, f"Cuentas (opción {etiqueta})")
 
 # ─── CATEGORÍA: SALDO ──────────────────────────────────────────────
 async def categoria_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1604,13 +1716,15 @@ async def categoria_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         get_texto(db, "titulo_saldo"),
         parse_mode="Markdown",
-        reply_markup=teclado_saldo_menu()
+        reply_markup=teclado_saldo_menu(db)
     )
 
 async def ver_producto_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    texto_opcion, precio = SALDO[q.data]
+    db = load_db()
+    texto_defecto, precio = SALDO[q.data]
+    texto_opcion = get_subetiqueta(db, "saldo", q.data, texto_defecto)
 
     if precio is None:
         await q.edit_message_text(
@@ -1620,7 +1734,6 @@ async def ver_producto_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    db = load_db()
     compra_id = crear_compra(db, q.from_user.id, q.from_user.username or q.from_user.first_name, f"Saldo {texto_opcion}", precio)
     await iniciar_pago(q, context, compra_id, precio, f"Saldo {texto_opcion}")
 
@@ -1798,10 +1911,11 @@ async def pedido_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
+    db = load_db()
     await q.edit_message_text(
         "🍽️ *¿Dónde quieres pedir?*",
         parse_mode="Markdown",
-        reply_markup=teclado_restaurantes()
+        reply_markup=teclado_restaurantes(db)
     )
     return RESTAURANTE
 
@@ -1825,7 +1939,9 @@ async def seleccionar_restaurante_callback(update: Update, context: ContextTypes
         )
         return PEDIDO
 
-    nombre, precio = PLATAFORMAS[clave]
+    db = load_db()
+    nombre_defecto, precio = PLATAFORMAS[clave]
+    nombre = get_subetiqueta(db, "pedidos", clave, nombre_defecto)
     context.user_data["restaurante_clave"] = clave
     context.user_data["restaurante_nombre"] = nombre
     context.user_data["comision_texto"] = f"{precio:.2f}€ (precio fijo)"
@@ -1845,7 +1961,9 @@ async def seleccionar_evento_callback(update: Update, context: ContextTypes.DEFA
     q = update.callback_query
     await q.answer()
     clave = q.data.split("_", 1)[1]
-    nombre, precio, pregunta = EVENTOS[clave]
+    db = load_db()
+    nombre_defecto, precio, pregunta = EVENTOS[clave]
+    nombre = get_subetiqueta(db, "pedidos", clave, nombre_defecto)
     context.user_data["restaurante_clave"] = clave
     context.user_data["restaurante_nombre"] = nombre
     context.user_data["comision_texto"] = f"{precio:.2f}€ (precio fijo)"
@@ -2197,6 +2315,9 @@ def main():
     app.add_handler(CommandHandler("textos", cmd_textos))
     app.add_handler(CommandHandler("settexto", cmd_settexto))
     app.add_handler(CommandHandler("resettexto", cmd_resettexto))
+    app.add_handler(CommandHandler("subnombres", cmd_subnombres))
+    app.add_handler(CommandHandler("setsubnombre", cmd_setsubnombre))
+    app.add_handler(CommandHandler("resetsubnombre", cmd_resetsubnombre))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("cancelarpedido", cmd_cancelarpedido))
