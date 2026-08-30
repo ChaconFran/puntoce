@@ -4,7 +4,8 @@ import json
 import asyncio
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from string import Template
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,8 +24,15 @@ GRUPO_ADMIN_ID = -1004416626509
 # (otro terminal, otra sesión de Termux...), siempre lee y escribe el MISMO archivo
 # — antes, al usar una ruta relativa, un simple cambio de carpeta hacía que pareciera
 # que los cambios "no se guardaban".
+# Carpeta donde viven TODOS los archivos de datos (base de datos + stock).
+# - Local/Termux: por defecto es la propia carpeta del script (no hace falta tocar nada).
+# - Railway (o cualquier hosting con sistema de archivos efímero): PON un Volume
+#   montado (ej. en /data) y define la variable de entorno DATA_DIR=/data. Si no lo
+#   haces, cada redeploy te borra pedidos.json y los .txt de stock, aunque el código
+#   esté perfecto — es lo que te estaba pasando.
 CARPETA_BASE = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.environ.get("DB_PATH", os.path.join(CARPETA_BASE, "pedidos.json"))
+DATA_DIR = os.environ.get("DATA_DIR", CARPETA_BASE)
+DB_FILE = os.environ.get("DB_PATH", os.path.join(DATA_DIR, "pedidos.json"))
 
 logging.basicConfig(level=logging.INFO)
 
@@ -54,8 +62,8 @@ PRECIO_PERSONALIZADO = 6.0
 # el siguiente ID disponible y se le envía al comprador; ese ID se borra
 # del archivo para no repetirlo.
 ROPA = {
-    "camisetas":  ("Camisetas", 5.0, os.path.join(CARPETA_BASE, "stock_camisetas.txt")),
-    "pantalones": ("Pantalones", 8.0, os.path.join(CARPETA_BASE, "stock_pantalones_cc.txt")),
+    "camisetas":  ("Camisetas", 5.0, os.path.join(DATA_DIR, "stock_camisetas.txt")),
+    "pantalones": ("Pantalones", 8.0, os.path.join(DATA_DIR, "stock_pantalones_cc.txt")),
 }
 
 def tomar_id_stock(stock_file):
@@ -250,6 +258,8 @@ def load_db():
     db.setdefault("compras", {})
     db.setdefault("ultimo_compra_numero", 0)
     db.setdefault("regalos", [])  # lista de regalos independientes, ver /addregalo
+    db.setdefault("tickets", {})
+    db.setdefault("ultimo_ticket_numero", 0)
     return db
 
 def save_db(db):
@@ -267,18 +277,26 @@ ESTADOS_PEDIDO = {
     "cancelado":    "❌ Cancelado",
 }
 
+ESTADOS_TICKET = {
+    "enviado":      "📨 Enviado",
+    "recibido":     "📥 Recibido",
+    "investigando": "🔍 Investigando",
+    "cerrado":      "✅ Ticket cerrado",
+}
+
 # ─── TECLADOS ─────────────────────────────────────────────────────
 # Nombres visibles de las pestañas del menú principal. Se pueden cambiar
 # desde el propio bot con /setnombre <clave> <texto nuevo>, sin tocar código.
 ETIQUETAS_DEFECTO = {
-    "perfil":   "👤 Perfil",
-    "pedidos":  "🍔 Pedidos a domicilio",
-    "cc":       "🧥 CC",
-    "cuentas":  "🎬 Cuentas",
-    "saldo":    "💰 Saldo",
-    "esim":     "📱 eSIM",
-    "regalos":  "🎁 Regalos Aleatorios",
-    "soporte":  "🆘 Soporte",
+    "perfil":         "🎯 GANA DESCUENTOS",
+    "pedidos":        "🍔 Pedidos a domicilio",
+    "mas_productos":  "🛒 Más productos",
+    "cc":             "🧥 CC",
+    "cuentas":        "🎬 Cuentas",
+    "saldo":          "💰 Saldo",
+    "esim":           "📱 eSIM",
+    "regalos":        "🎁 Regalo Semanal",
+    "soporte":        "🆘 Soporte",
 }
 
 def get_etiquetas(db):
@@ -295,11 +313,12 @@ TEXTOS_DEFECTO = {
         "Bot para compras automáticas — por si quieres ser de los primeros en ser atendido.\n\n"
         "Elige una categoría:"
     ),
-    "titulo_pedidos":   "🍔 *Pedidos a domicilio*\n\nElige una opción:",
-    "titulo_cc":        "🧥 *CC — Cold Culture*\n\nElige una prenda:",
-    "titulo_cuentas":   "🎬 *Cuentas*\n\nTodas las opciones al mismo precio: *$precio€*.\n\nElige una:",
-    "titulo_saldo":     "💰 *Saldo*\n\nElige la cantidad:",
-    "titulo_perfil":    "👤 *Perfil*\n\nElige una opción:",
+    "titulo_pedidos":       "🍔 *Pedidos a domicilio*\n\nElige una opción:",
+    "titulo_mas_productos": "🛒 *Más productos*\n\nElige una categoría:",
+    "titulo_cc":            "🧥 *CC — Cold Culture*\n\nElige una prenda:",
+    "titulo_cuentas":       "🎬 *Cuentas*\n\nElige una opción (el precio aparece al elegirla):",
+    "titulo_saldo":         "💰 *Saldo*\n\nElige la cantidad:",
+    "titulo_perfil":        "🎯 *GANA DESCUENTOS*\n\nElige una opción:",
     "titulo_referidos": (
         "🎯 *Referidos*\n\n"
         "Invita a tus amigos, sube de nivel y desbloquea descuentos en Zero Shop.\n\n"
@@ -315,6 +334,46 @@ def get_texto(db, clave, **kwargs):
     if kwargs:
         return Template(plantilla).safe_substitute(**kwargs)
     return plantilla
+
+# ─── IMÁGENES POR SECCIÓN ──────────────────────────────────────────
+# Cualquier sección (bienvenida, cada categoría...) puede llevar una imagen
+# opcional, además de su texto. Se gestiona con /imagenseccion <clave>,
+# /quitarimagenseccion <clave> y /verimagenes.
+def get_imagen_seccion(db, clave):
+    return db.get("_config", {}).get("imagenes", {}).get(clave)
+
+async def mostrar_seccion(destino, context, clave, texto, teclado, es_callback=True):
+    """Muestra el texto (y la imagen, si esa sección tiene una) de cualquier pantalla
+    del bot, gestionando sola el cambio entre mensaje de texto y de foto."""
+    db = load_db()
+    imagen = get_imagen_seccion(db, clave)
+
+    if es_callback:
+        q = destino
+        chat_id = q.from_user.id
+        es_foto_actual = bool(q.message.photo)
+        if imagen and not es_foto_actual:
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_photo(chat_id=chat_id, photo=imagen, caption=texto, parse_mode="Markdown", reply_markup=teclado)
+        elif imagen and es_foto_actual:
+            await q.edit_message_caption(caption=texto, parse_mode="Markdown", reply_markup=teclado)
+        elif not imagen and es_foto_actual:
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(chat_id=chat_id, text=texto, parse_mode="Markdown", reply_markup=teclado)
+        else:
+            await q.edit_message_text(texto, parse_mode="Markdown", reply_markup=teclado)
+    else:
+        message = destino
+        if imagen:
+            await message.reply_photo(photo=imagen, caption=texto, parse_mode="Markdown", reply_markup=teclado)
+        else:
+            await message.reply_text(texto, parse_mode="Markdown", reply_markup=teclado)
 
 # Nombres de las "sub-pestañas" dentro de cada categoría (ej. los botones de
 # Saldo, las prendas de CC, los restaurantes de Pedidos...). Se identifican por
@@ -334,12 +393,26 @@ def menu_principal():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(et["perfil"], callback_data="cat_perfil")],
         [InlineKeyboardButton(et["pedidos"], callback_data="cat_pedidos")],
+        [InlineKeyboardButton(et["mas_productos"], callback_data="cat_mas_productos")],
+        [InlineKeyboardButton(et["regalos"], callback_data="cat_regalo")],
+        [InlineKeyboardButton(et["soporte"], callback_data="cat_soporte")],
+    ])
+
+def teclado_mas_productos_menu(db):
+    et = get_etiquetas(db)
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(et["cc"], callback_data="cat_ropa")],
         [InlineKeyboardButton(et["cuentas"], callback_data="cat_pantalones")],
         [InlineKeyboardButton(et["saldo"], callback_data="cat_saldo")],
         [InlineKeyboardButton(et["esim"], callback_data="cat_target")],
-        [InlineKeyboardButton(et["regalos"], callback_data="cat_regalo")],
-        [InlineKeyboardButton(et["soporte"], url=f"https://t.me/{CONTACTO_ADMIN}")],
+        [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
+    ])
+
+def teclado_soporte_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎫 Abrir un ticket (prioridad)", callback_data="ticket_nuevo")],
+        [InlineKeyboardButton("💬 Contactar directamente", url=f"https://t.me/{CONTACTO_ADMIN}")],
+        [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
     ])
 
 def teclado_perfil_menu():
@@ -370,7 +443,7 @@ def teclado_ropa_menu(db):
         [InlineKeyboardButton(get_subetiqueta(db, 'cc', clave, nombre), callback_data=f"ropa_{clave}")]
         for clave, (nombre, precio, _stock) in ROPA.items()
     ]
-    filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
+    filas.append([InlineKeyboardButton("🔙 Volver", callback_data="cat_mas_productos")])
     return InlineKeyboardMarkup(filas)
 
 def teclado_saldo_menu(db):
@@ -378,7 +451,7 @@ def teclado_saldo_menu(db):
         [InlineKeyboardButton(get_subetiqueta(db, "saldo", clave, texto_defecto), callback_data=f"{clave}")]
         for clave, (texto_defecto, _precio) in SALDO.items()
     ]
-    filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
+    filas.append([InlineKeyboardButton("🔙 Volver", callback_data="cat_mas_productos")])
     return InlineKeyboardMarkup(filas)
 
 def volver_menu_keyboard():
@@ -424,44 +497,177 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if uid not in referrer["referrals"]:
                 referrer["referrals"].append(uid)
             u_data["referred_by"] = referrer_id
-            bonus_msg = "\n\n👋 ¡Te han invitado! Ve a 👤 *Perfil → Referidos* → únete al canal y pulsa *Verificar suscripción* para que tu amigo reciba su XP."
+            bonus_msg = "\n\n👋 ¡Te han invitado! Ve a 🎯 *GANA DESCUENTOS → Referidos* → únete al canal y pulsa *Verificar suscripción* para que tu amigo reciba su XP."
 
     save_db(db)
-    await update.message.reply_text(get_texto(db, "bienvenida") + bonus_msg, parse_mode="Markdown", reply_markup=menu_principal())
+    await mostrar_seccion(update.message, context, "bienvenida", get_texto(db, "bienvenida") + bonus_msg, menu_principal(), es_callback=False)
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Vuelve al menú principal en cualquier momento (también corta un pedido a medias)."""
     context.user_data.clear()
     db = load_db()
-    await update.message.reply_text(get_texto(db, "bienvenida"), parse_mode="Markdown", reply_markup=menu_principal())
+    await mostrar_seccion(update.message, context, "bienvenida", get_texto(db, "bienvenida"), menu_principal(), es_callback=False)
     return ConversationHandler.END
 
 async def volver_al_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    await q.edit_message_text(get_texto(db, "bienvenida"), parse_mode="Markdown", reply_markup=menu_principal())
+    await mostrar_seccion(q, context, "bienvenida", get_texto(db, "bienvenida"), menu_principal())
+
+async def categoria_mas_productos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    db = load_db()
+    await mostrar_seccion(q, context, "titulo_mas_productos", get_texto(db, "titulo_mas_productos"), teclado_mas_productos_menu(db))
+
+async def categoria_soporte(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🆘 *Soporte*\n\n"
+        "¿Tienes un problema con una compra o pedido? Abre un ticket para que se atienda con prioridad.\n"
+        "Para cualquier otra consulta, puedes escribirnos directamente.",
+        parse_mode="Markdown",
+        reply_markup=teclado_soporte_menu()
+    )
+
+# ─── SISTEMA DE TICKETS DE SOPORTE ──────────────────────────────────
+def teclado_admin_ticket(numero):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Recibido", callback_data=f"ticketestado_{numero}_recibido"),
+         InlineKeyboardButton("🔍 Investigando", callback_data=f"ticketestado_{numero}_investigando")],
+        [InlineKeyboardButton("✅ Cerrar ticket", callback_data=f"ticketestado_{numero}_cerrado")],
+    ])
+
+def texto_para_admin_ticket(numero, t):
+    return f"""
+🎫 *TICKET #{numero}*
+
+👤 *De:* @{t['username']} (ID `{t['usuario_id']}`)
+📦 *Pedido/compra afectada:* {t['motivo']}
+📝 *Descripción:* {t['descripcion']}
+
+📌 Estado: {ESTADOS_TICKET[t['estado']]}
+"""
+
+async def ticket_nuevo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data["ticket_paso"] = "motivo"
+    await q.edit_message_text(
+        "🎫 *Nuevo ticket*\n\n"
+        "¿Qué pedido o compra tiene el problema? (número si lo tienes, o una breve descripción)",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")]])
+    )
+
+async def capturar_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Captura las 2 respuestas del cuestionario de ticket. No hace nada si no se
+    estaba en ese flujo (fuera de esto, se ignora el mensaje)."""
+    paso = context.user_data.get("ticket_paso")
+    if not paso:
+        return
+
+    texto = update.message.text.strip()
+
+    if paso == "motivo":
+        context.user_data["ticket_motivo"] = texto
+        context.user_data["ticket_paso"] = "descripcion"
+        await update.message.reply_text(
+            "📝 Describe brevemente el problema.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")]])
+        )
+        return
+
+    if paso == "descripcion":
+        user = update.effective_user
+        db = load_db()
+        db["ultimo_ticket_numero"] += 1
+        numero = db["ultimo_ticket_numero"]
+        ticket = {
+            "usuario_id": user.id,
+            "username": user.username or user.first_name,
+            "motivo": context.user_data.get("ticket_motivo", "-"),
+            "descripcion": texto,
+            "estado": "enviado",
+            "creado_at": datetime.now().isoformat(),
+        }
+        db["tickets"][str(numero)] = ticket
+        save_db(db)
+        context.user_data.pop("ticket_paso", None)
+        context.user_data.pop("ticket_motivo", None)
+
+        await update.message.reply_text(
+            f"✅ *Ticket #{numero} enviado.*\n\nEstado: {ESTADOS_TICKET['enviado']}\n"
+            f"Te avisaremos aquí mismo según lo vayamos gestionando.",
+            parse_mode="Markdown",
+            reply_markup=volver_menu_keyboard()
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=GRUPO_ADMIN_ID,
+                text=texto_para_admin_ticket(numero, ticket),
+                parse_mode="Markdown",
+                reply_markup=teclado_admin_ticket(numero)
+            )
+        except Exception as e:
+            logging.error(f"No se pudo enviar el ticket #{numero} al grupo de admins: {e}")
+
+async def ticketestado_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, numero_str, nuevo_estado = q.data.split("_")
+    db = load_db()
+    ticket = db["tickets"].get(numero_str)
+    if not ticket:
+        await q.answer("Ticket no encontrado.", show_alert=True)
+        return
+
+    ticket["estado"] = nuevo_estado
+    save_db(db)
+
+    await q.edit_message_text(
+        texto_para_admin_ticket(numero_str, ticket),
+        parse_mode="Markdown",
+        reply_markup=teclado_admin_ticket(numero_str)
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ticket["usuario_id"],
+            text=f"🎫 Tu ticket *#{numero_str}* ahora está: {ESTADOS_TICKET[nuevo_estado]}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+async def cmd_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista los tickets abiertos (no cerrados). Uso interno del equipo, como /cola."""
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    activos = [(int(n), t) for n, t in db["tickets"].items() if t["estado"] != "cerrado"]
+    if not activos:
+        await update.message.reply_text("✅ No hay tickets abiertos.")
+        return
+    activos.sort()
+    lineas = [f"#{n} — @{t['username']} — {ESTADOS_TICKET[t['estado']]}" for n, t in activos]
+    await update.message.reply_text("🎫 *Tickets abiertos:*\n\n" + "\n".join(lineas), parse_mode="Markdown")
 
 # ─── CATEGORÍA: PERFIL (Estadísticas / Referidos / Mis pedidos) ────
 async def categoria_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    await q.edit_message_text(
-        get_texto(db, "titulo_perfil"),
-        parse_mode="Markdown",
-        reply_markup=teclado_perfil_menu()
-    )
+    await mostrar_seccion(q, context, "titulo_perfil", get_texto(db, "titulo_perfil"), teclado_perfil_menu())
 
 async def perfil_referidos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    await q.edit_message_text(
-        get_texto(db, "titulo_referidos"),
-        parse_mode="Markdown",
-        reply_markup=teclado_referidos_submenu()
-    )
+    await mostrar_seccion(q, context, "titulo_referidos", get_texto(db, "titulo_referidos"), teclado_referidos_submenu())
 
 async def notificar_nuevos_premios(context, uid, u, nivel_anterior, nivel_nuevo, premios):
     nuevos_niveles = [n for n in premios if nivel_anterior < n <= nivel_nuevo]
@@ -941,6 +1147,13 @@ async def perfil_pedidos_callback(update: Update, context: ContextTypes.DEFAULT_
         estado_txt = ESTADOS_COMPRA.get(c["estado"], c["estado"])
         lineas.append(f"🛍️ Compra #{numero} — {c['producto']} ({c['precio_eur']:.2f}€) — {estado_txt}")
 
+    tickets_usuario = sorted(
+        ((int(n), t) for n, t in db["tickets"].items() if t.get("usuario_id") == uid),
+        key=lambda x: x[0]
+    )
+    for numero, t in tickets_usuario:
+        lineas.append(f"🎫 Ticket #{numero} — {ESTADOS_TICKET[t['estado']]}")
+
     texto = "📦 *TUS PEDIDOS Y COMPRAS*\n\n" + "\n".join(lineas) if lineas else "📦 Aún no tienes ningún pedido ni compra."
     await q.edit_message_text(
         texto, parse_mode="Markdown",
@@ -1234,12 +1447,68 @@ async def cmd_verregalos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lineas.append(f"#{g['id']}: {resumen} — {g['cupo_restante']}/{g['cupo_total']} — {imagen_txt}")
     await update.message.reply_text("🎁 Regalos configurados:\n\n" + "\n".join(lineas))
 
+# ─── COMANDOS DE ADMINISTRACIÓN: IMÁGENES POR SECCIÓN ──────────────
+# Claves válidas: las mismas que /textos (bienvenida, titulo_pedidos, titulo_cc,
+# titulo_cuentas, titulo_saldo, titulo_perfil, titulo_referidos, titulo_mas_productos)
+async def cmd_imagenseccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prepara el bot para recibir una foto y asignarla a una sección concreta.
+    Uso: /imagenseccion <clave>  y luego mandas la foto."""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Uso: /imagenseccion <clave>\nLuego mándame la foto.\n"
+            "Claves disponibles: " + ", ".join(TEXTOS_DEFECTO.keys())
+        )
+        return
+    clave = context.args[0]
+    if clave not in TEXTOS_DEFECTO:
+        await update.message.reply_text("Esa clave no existe. Claves disponibles: " + ", ".join(TEXTOS_DEFECTO.keys()))
+        return
+    db = load_db()
+    db.setdefault("_config", {})["esperando_imagen_seccion"] = clave
+    save_db(db)
+    await update.message.reply_text(f"📷 Envíame ahora la imagen para la sección «{clave}».")
+
+async def cmd_quitarimagenseccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /quitarimagenseccion <clave>")
+        return
+    clave = context.args[0]
+    db = load_db()
+    db.setdefault("_config", {}).setdefault("imagenes", {}).pop(clave, None)
+    save_db(db)
+    await update.message.reply_text(f"🗑️ Imagen de la sección «{clave}» eliminada.")
+
+async def cmd_verimagenes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    imagenes = db.get("_config", {}).get("imagenes", {})
+    lineas = [f"{clave} → {'📷 con imagen' if clave in imagenes else 'sin imagen'}" for clave in TEXTOS_DEFECTO]
+    await update.message.reply_text(
+        "🖼️ Imágenes por sección:\n\n" + "\n".join(lineas) +
+        "\n\nAsigna una con /imagenseccion <clave> y mandando la foto después."
+    )
+
 async def capturar_imagen_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Si un admin pidió /imagenregalo <id>, la siguiente foto que mande se asigna a ese regalo."""
+    """Si un admin pidió /imagenregalo <id> o /imagenseccion <clave>, la siguiente
+    foto que mande se asigna a ese regalo o a esa sección."""
     if not es_admin(update.effective_user.id):
         return
     db = load_db()
     cfg = db.setdefault("_config", {})
+
+    seccion = cfg.get("esperando_imagen_seccion")
+    if seccion:
+        cfg.setdefault("imagenes", {})[seccion] = update.message.photo[-1].file_id
+        cfg["esperando_imagen_seccion"] = None
+        save_db(db)
+        await update.message.reply_text(f"✅ Imagen guardada para la sección «{seccion}».")
+        return
+
     id_ = cfg.get("esperando_imagen_regalo_id")
     if not id_:
         return
@@ -1510,6 +1779,37 @@ async def cmd_resetsubnombre(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_db(db)
     await update.message.reply_text(f"✅ «{categoria}:{clave}» devuelto a su nombre original: {defectos[clave]}")
 
+async def cmd_setpreciocuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cambia el precio de una opción concreta de Cuentas. Uso: /setpreciocuenta <numero> <precio>"""
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Uso: /setpreciocuenta <numero 1-8> <precio>\nEj: /setpreciocuenta 3 6.99")
+        return
+    numero, precio_txt = context.args
+    if numero not in [str(i) for i in range(1, NUM_PANTALONES + 1)]:
+        await update.message.reply_text(f"El número debe estar entre 1 y {NUM_PANTALONES}.")
+        return
+    try:
+        precio = float(precio_txt.replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("El precio debe ser un número.")
+        return
+    db = load_db()
+    set_precio_cuenta(db, numero, precio)
+    save_db(db)
+    await update.message.reply_text(f"✅ Precio de la opción {numero} de Cuentas puesto a {precio:.2f}€.")
+
+async def cmd_verpreciocuentas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    lineas = [f"{i} → {get_precio_cuenta(db, i):.2f}€" for i in range(1, NUM_PANTALONES + 1)]
+    await update.message.reply_text(
+        "💶 Precios de Cuentas:\n\n" + "\n".join(lineas) +
+        "\n\nCambia uno con /setpreciocuenta <numero> <precio>"
+    )
+
 # ─── COMANDOS DE ADMINISTRACIÓN: ESTADÍSTICAS Y AVISOS ─────────────
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_admin(update.effective_user.id):
@@ -1533,6 +1833,17 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def enviar_broadcast(context, db, mensaje):
+    """Manda un mensaje a todos los usuarios registrados. Devuelve (enviados, fallidos)."""
+    enviados, fallidos = 0, 0
+    for uid in db.get("usuarios", {}):
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=mensaje, parse_mode="Markdown")
+            enviados += 1
+        except Exception:
+            fallidos += 1
+    return enviados, fallidos
+
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_admin(update.effective_user.id):
         return
@@ -1542,14 +1853,18 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     mensaje = partes[1]
     db = load_db()
-    enviados, fallidos = 0, 0
-    for uid in db.get("usuarios", {}):
-        try:
-            await context.bot.send_message(chat_id=int(uid), text=mensaje, parse_mode="Markdown")
-            enviados += 1
-        except Exception:
-            fallidos += 1
+    enviados, fallidos = await enviar_broadcast(context, db, mensaje)
     await update.message.reply_text(f"📣 Enviado a {enviados} usuarios ({fallidos} fallidos).")
+
+async def cmd_avisarregalos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Avisa a todos de que hay regalos nuevos. Uso normal: lo lanzas tú manualmente
+    cada domingo después de actualizar los regalos con /addregalo."""
+    if not es_admin(update.effective_user.id):
+        return
+    db = load_db()
+    mensaje = "🎁 *¡Nuevos regalos disponibles esta semana!*\n\nEntra en 🎁 Regalo Semanal para reclamarlos antes de que se agoten."
+    enviados, fallidos = await enviar_broadcast(context, db, mensaje)
+    await update.message.reply_text(f"📣 Aviso de regalos enviado a {enviados} usuarios ({fallidos} fallidos).")
 
 # ─── COMANDOS DE ADMINISTRACIÓN: PEDIDOS ────────────────────────────
 async def cmd_cancelarpedido(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1594,6 +1909,12 @@ async def cmd_addstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for id_producto in nuevos_ids:
             f.write(id_producto + "\n")
     await update.message.reply_text(f"✅ Añadidos {len(nuevos_ids)} ID(s) a {clave}. Stock actual: {contar_stock(stock_file)}")
+
+    db = load_db()
+    nombre_mostrado = get_subetiqueta(db, "cc", clave, _nombre)
+    mensaje = f"📦 *¡Nuevo stock disponible!*\n\nAcaba de entrar stock de *{nombre_mostrado}* en 🛒 Más productos → CC."
+    enviados, fallidos = await enviar_broadcast(context, db, mensaje)
+    await update.message.reply_text(f"📣 Aviso de stock nuevo enviado a {enviados} usuarios ({fallidos} fallidos).")
 
 async def cmd_verstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_admin(update.effective_user.id):
@@ -1672,6 +1993,22 @@ async def cmd_adminayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /subnombres <categoria> — ver claves y nombres (saldo, cc, cuentas, pedidos)
 /setsubnombre <categoria> <clave> <texto nuevo> — renombrar una
 /resetsubnombre <categoria> <clave> — devolverla a su nombre original
+
+*Precios de Cuentas*
+/verpreciocuentas — ver el precio de cada opción (1-8)
+/setpreciocuenta <numero> <precio> — cambiar el precio de una opción
+
+*Imágenes por sección*
+/verimagenes — ver qué secciones tienen imagen
+/imagenseccion <clave> — la próxima foto que mandes se asigna a esa sección
+/quitarimagenseccion <clave> — quitar la imagen de una sección
+
+*Regalo Semanal*
+/avisarregalos — avisar a todos de que hay regalos nuevos
+
+*Tickets de soporte*
+/tickets — ver los tickets abiertos
+(el estado se cambia con los botones del mensaje que llega al grupo)
 """
     await update.message.reply_text(texto, parse_mode="Markdown")
 
@@ -1680,22 +2017,14 @@ async def categoria_pedidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    await q.edit_message_text(
-        get_texto(db, "titulo_pedidos"),
-        parse_mode="Markdown",
-        reply_markup=teclado_pedidos_menu()
-    )
+    await mostrar_seccion(q, context, "titulo_pedidos", get_texto(db, "titulo_pedidos"), teclado_pedidos_menu())
 
 # ─── CATEGORÍA: ROPA ───────────────────────────────────────────────
 async def categoria_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    await q.edit_message_text(
-        get_texto(db, "titulo_cc"),
-        parse_mode="Markdown",
-        reply_markup=teclado_ropa_menu(db)
-    )
+    await mostrar_seccion(q, context, "titulo_cc", get_texto(db, "titulo_cc"), teclado_ropa_menu(db))
 
 async def ver_producto_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1772,28 +2101,31 @@ async def cc_comprar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ─── CATEGORÍA: PANTALONES ──────────────────────────────────────────
 # 8 opciones numeradas, todas al mismo precio (da igual cuál se elija).
 NUM_PANTALONES = 8
-PRECIO_PANTALONES = 4.99
+PRECIO_PANTALONES = 4.99  # precio por defecto; cada opción puede tener el suyo propio
+
+def get_precio_cuenta(db, numero):
+    return db.get("_config", {}).get("precios_cuentas", {}).get(str(numero), PRECIO_PANTALONES)
+
+def set_precio_cuenta(db, numero, precio):
+    db.setdefault("_config", {}).setdefault("precios_cuentas", {})[str(numero)] = precio
+
+def reset_precio_cuenta(db, numero):
+    db.setdefault("_config", {}).setdefault("precios_cuentas", {}).pop(str(numero), None)
 
 def teclado_pantalones_menu(db):
+    # Sin precio en el botón a propósito: el precio de cada opción aparece al pulsarla.
     filas = [
-        [InlineKeyboardButton(
-            f"{get_subetiqueta(db, 'cuentas', str(i), str(i))} — {PRECIO_PANTALONES:.2f}€",
-            callback_data=f"pantalon_{i}"
-        )]
+        [InlineKeyboardButton(get_subetiqueta(db, 'cuentas', str(i), str(i)), callback_data=f"pantalon_{i}")]
         for i in range(1, NUM_PANTALONES + 1)
     ]
-    filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
+    filas.append([InlineKeyboardButton("🔙 Volver", callback_data="cat_mas_productos")])
     return InlineKeyboardMarkup(filas)
 
 async def categoria_pantalones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    await q.edit_message_text(
-        get_texto(db, "titulo_cuentas", precio=f"{PRECIO_PANTALONES:.2f}"),
-        parse_mode="Markdown",
-        reply_markup=teclado_pantalones_menu(db)
-    )
+    await mostrar_seccion(q, context, "titulo_cuentas", get_texto(db, "titulo_cuentas"), teclado_pantalones_menu(db))
 
 async def ver_pantalon_numero(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1801,22 +2133,19 @@ async def ver_pantalon_numero(update: Update, context: ContextTypes.DEFAULT_TYPE
     numero = q.data.split("_", 1)[1]
     db = load_db()
     etiqueta = get_subetiqueta(db, "cuentas", numero, numero)
+    precio = get_precio_cuenta(db, numero)
     compra_id = crear_compra(
         db, q.from_user.id, q.from_user.username or q.from_user.first_name,
-        f"Cuentas (opción {etiqueta})", PRECIO_PANTALONES
+        f"Cuentas (opción {etiqueta})", precio
     )
-    await iniciar_pago(q, context, compra_id, PRECIO_PANTALONES, f"Cuentas (opción {etiqueta})")
+    await iniciar_pago(q, context, compra_id, precio, f"Cuentas (opción {etiqueta})")
 
 # ─── CATEGORÍA: SALDO ──────────────────────────────────────────────
 async def categoria_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     db = load_db()
-    await q.edit_message_text(
-        get_texto(db, "titulo_saldo"),
-        parse_mode="Markdown",
-        reply_markup=teclado_saldo_menu(db)
-    )
+    await mostrar_seccion(q, context, "titulo_saldo", get_texto(db, "titulo_saldo"), teclado_saldo_menu(db))
 
 async def ver_producto_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1852,14 +2181,32 @@ async def categoria_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # concreto se borra del chat (mensaje y foto incluidos) y desaparece de la
 # lista si se agota su cupo. No es "uno por persona": es un cupo compartido
 # por regalo, para los primeros que lo reclamen.
+def tiempo_hasta_proximo_regalo():
+    """Cuenta atrás hasta el próximo domingo a las 23:59 (hora de España)."""
+    tz = ZoneInfo("Europe/Madrid")
+    ahora = datetime.now(tz)
+    dias_hasta_domingo = (6 - ahora.weekday()) % 7  # weekday(): lunes=0 ... domingo=6
+    objetivo = (ahora + timedelta(days=dias_hasta_domingo)).replace(hour=23, minute=59, second=0, microsecond=0)
+    if objetivo <= ahora:
+        objetivo += timedelta(days=7)
+    restante = objetivo - ahora
+    dias, resto_segundos = restante.days, restante.seconds
+    horas, resto_segundos = divmod(resto_segundos, 3600)
+    minutos = resto_segundos // 60
+    return f"{dias}d {horas}h {minutos}min"
+
 async def _mostrar_regalo_en_indice(q, context, indice):
     db = load_db()
     disponibles = [g for g in db.get("regalos", []) if g.get("cupo_restante", 0) > 0]
+    countdown = f"\n\n⏳ Próxima actualización de regalos en: *{tiempo_hasta_proximo_regalo()}*"
 
     if not disponibles:
         try:
             await q.edit_message_text(
-                "🎁 *Regalos Aleatorios*\n\nAhora mismo no hay ningún regalo disponible. ¡Vuelve a mirar más tarde!",
+                "🎁 *Regalo Semanal*\n\n"
+                "Ahora mismo no hay ningún regalo disponible.\n"
+                "Los regalos se actualizan todos los domingos a las 23:59 (hora de España)."
+                + countdown,
                 parse_mode="Markdown",
                 reply_markup=volver_menu_keyboard()
             )
@@ -1876,6 +2223,7 @@ async def _mostrar_regalo_en_indice(q, context, indice):
     cabecera = f"🎁 *Regalo {indice + 1}/{len(disponibles)}*\n\n{texto}\n\n🏃 Quedan *{regalo['cupo_restante']}* unidad(es)."
     if ya_reclamado:
         cabecera += "\n\n✅ Ya reclamaste este regalo."
+    cabecera += countdown
 
     fila_nav = []
     if indice > 0:
@@ -1948,12 +2296,19 @@ async def regalo_reclamar_callback(update: Update, context: ContextTypes.DEFAULT
         await q.message.delete()
     except Exception:
         pass
-    await context.bot.send_message(
-        chat_id=uid,
-        text=f"🎉 *¡Regalo reclamado!*\n\n{regalo.get('texto', '')}",
-        parse_mode="Markdown",
-        reply_markup=volver_menu_keyboard()
-    )
+
+    texto_final = f"🎉 *¡Regalo reclamado!*\n\n{regalo.get('texto', '')}\n\nTe lo enviamos por privado, ¡disfrútalo!"
+    imagen = regalo.get("imagen_file_id")
+    if imagen:
+        await context.bot.send_photo(
+            chat_id=uid, photo=imagen, caption=texto_final,
+            parse_mode="Markdown", reply_markup=volver_menu_keyboard()
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=uid, text=texto_final,
+            parse_mode="Markdown", reply_markup=volver_menu_keyboard()
+        )
 
     try:
         await context.bot.send_message(
@@ -2430,6 +2785,17 @@ def main():
     app.add_handler(CommandHandler("addstock", cmd_addstock))
     app.add_handler(CommandHandler("verstock", cmd_verstock))
     app.add_handler(CommandHandler("resetxp", cmd_resetxp))
+    app.add_handler(CommandHandler("imagenseccion", cmd_imagenseccion))
+    app.add_handler(CommandHandler("quitarimagenseccion", cmd_quitarimagenseccion))
+    app.add_handler(CommandHandler("verimagenes", cmd_verimagenes))
+    app.add_handler(CommandHandler("setpreciocuenta", cmd_setpreciocuenta))
+    app.add_handler(CommandHandler("verpreciocuentas", cmd_verpreciocuentas))
+    app.add_handler(CommandHandler("avisarregalos", cmd_avisarregalos))
+    app.add_handler(CommandHandler("tickets", cmd_tickets))
+    app.add_handler(CallbackQueryHandler(categoria_mas_productos, pattern="^cat_mas_productos$"))
+    app.add_handler(CallbackQueryHandler(categoria_soporte, pattern="^cat_soporte$"))
+    app.add_handler(CallbackQueryHandler(ticket_nuevo_callback, pattern="^ticket_nuevo$"))
+    app.add_handler(CallbackQueryHandler(ticketestado_callback, pattern="^ticketestado_"))
     app.add_handler(CommandHandler("adminayuda", cmd_adminayuda))
     app.add_handler(CallbackQueryHandler(categoria_regalo, pattern="^cat_regalo$"))
     app.add_handler(CallbackQueryHandler(regalo_ver_callback, pattern="^regalo_ver_"))
@@ -2450,6 +2816,7 @@ def main():
     # que coincida (cada uno comprueba su propia bandera en user_data y no hace nada si no aplica).
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_codigo_cc), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_hash_pago), group=2)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_ticket), group=3)
 
     print("🛍️ Bot Zero Shop arrancado...")
     app.run_polling()
