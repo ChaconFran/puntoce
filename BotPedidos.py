@@ -18,7 +18,13 @@ BOT_TOKEN = "8997518264:AAFPKhQaqZfT83JPN-KOoLiowqq0-yQTjTs"
 # ID del grupo de administradores donde llegan los pedidos.
 GRUPO_ADMIN_ID = -1004416626509
 
-DB_FILE = os.environ.get("DB_PATH", "pedidos.json")
+# Todas las rutas de datos se anclan a la carpeta donde está este script, no a la
+# carpeta desde la que lo lances. Así, aunque un día lo arranques desde otro sitio
+# (otro terminal, otra sesión de Termux...), siempre lee y escribe el MISMO archivo
+# — antes, al usar una ruta relativa, un simple cambio de carpeta hacía que pareciera
+# que los cambios "no se guardaban".
+CARPETA_BASE = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.environ.get("DB_PATH", os.path.join(CARPETA_BASE, "pedidos.json"))
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,8 +54,8 @@ PRECIO_PERSONALIZADO = 6.0
 # el siguiente ID disponible y se le envía al comprador; ese ID se borra
 # del archivo para no repetirlo.
 ROPA = {
-    "camisetas":  ("Camisetas", 5.0, "stock_camisetas.txt"),
-    "pantalones": ("Pantalones", 8.0, "stock_pantalones_cc.txt"),
+    "camisetas":  ("Camisetas", 5.0, os.path.join(CARPETA_BASE, "stock_camisetas.txt")),
+    "pantalones": ("Pantalones", 8.0, os.path.join(CARPETA_BASE, "stock_pantalones_cc.txt")),
 }
 
 def tomar_id_stock(stock_file):
@@ -71,6 +77,29 @@ def contar_stock(stock_file):
         return 0
     with open(stock_file, "r", encoding="utf-8") as f:
         return len([l for l in f if l.strip()])
+
+def contar_stock_por_codigo(stock_file, codigo):
+    """Cuenta cuántas líneas del stock empiezan por esos 6 dígitos (ej. '123456...')."""
+    if not os.path.exists(stock_file):
+        return 0
+    with open(stock_file, "r", encoding="utf-8") as f:
+        return sum(1 for l in f if l.strip() and l.strip()[:6] == codigo)
+
+def tomar_id_stock_por_codigo(stock_file, codigo):
+    """Como tomar_id_stock, pero elimina y devuelve una línea concreta cuyos primeros
+    6 caracteres coinciden con el código (no simplemente la primera del archivo)."""
+    if not os.path.exists(stock_file):
+        return None
+    with open(stock_file, "r", encoding="utf-8") as f:
+        lineas = [l.strip() for l in f if l.strip()]
+    for i, linea in enumerate(lineas):
+        if linea[:6] == codigo:
+            id_tomado = linea
+            restantes = lineas[:i] + lineas[i + 1:]
+            with open(stock_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(restantes) + ("\n" if restantes else ""))
+            return id_tomado
+    return None
 
 # ─── PRODUCTOS: SALDO ──────────────────────────────────────────────
 # clave -> (texto a mostrar, precio en € o None si no tiene coste)
@@ -338,7 +367,7 @@ def teclado_pedidos_menu():
 
 def teclado_ropa_menu(db):
     filas = [
-        [InlineKeyboardButton(f"{get_subetiqueta(db, 'cc', clave, nombre)} — {precio:.0f}€", callback_data=f"ropa_{clave}")]
+        [InlineKeyboardButton(get_subetiqueta(db, 'cc', clave, nombre), callback_data=f"ropa_{clave}")]
         for clave, (nombre, precio, _stock) in ROPA.items()
     ]
     filas.append([InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")])
@@ -399,6 +428,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_db(db)
     await update.message.reply_text(get_texto(db, "bienvenida") + bonus_msg, parse_mode="Markdown", reply_markup=menu_principal())
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vuelve al menú principal en cualquier momento (también corta un pedido a medias)."""
+    context.user_data.clear()
+    db = load_db()
+    await update.message.reply_text(get_texto(db, "bienvenida"), parse_mode="Markdown", reply_markup=menu_principal())
+    return ConversationHandler.END
 
 async def volver_al_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -512,7 +548,7 @@ async def otorgar_xp_compra(context, uid, u, precio_eur, premios):
     await notificar_nuevos_premios(context, uid, u, nivel_antes, nivel_despues, premios)
 
 # ─── SISTEMA DE COMPRAS Y PAGO (cripto / transferencia) ────────────
-def crear_compra(db, comprador_id, username, producto, precio_eur, auto_entrega=False, stock_file=None):
+def crear_compra(db, comprador_id, username, producto, precio_eur, auto_entrega=False, stock_file=None, stock_codigo=None):
     db["ultimo_compra_numero"] += 1
     compra_id = db["ultimo_compra_numero"]
     db["compras"][str(compra_id)] = {
@@ -526,6 +562,7 @@ def crear_compra(db, comprador_id, username, producto, precio_eur, auto_entrega=
         "creado_at": datetime.now().isoformat(),
         "auto_entrega": auto_entrega,
         "stock_file": stock_file,
+        "stock_codigo": stock_codigo,
     }
     save_db(db)
     return compra_id
@@ -689,7 +726,10 @@ async def _confirmar_compra(context, db, compra_id, compra):
     extra_comprador = ""
     extra_admin = ""
     if compra.get("auto_entrega"):
-        id_producto = tomar_id_stock(compra["stock_file"])
+        if compra.get("stock_codigo"):
+            id_producto = tomar_id_stock_por_codigo(compra["stock_file"], compra["stock_codigo"])
+        else:
+            id_producto = tomar_id_stock(compra["stock_file"])
         if id_producto:
             extra_comprador = f"\n\n🎟️ *Tu ID de producto:* `{id_producto}`"
         else:
@@ -1661,14 +1701,73 @@ async def ver_producto_ropa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     clave = q.data.split("_", 1)[1]
-    nombre_defecto, precio, stock_file = ROPA[clave]
+    context.user_data["cc_esperando_codigo"] = clave
+    await q.edit_message_text(
+        "🔢 Escribe el *código de referencia* del producto (6 dígitos).",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")]])
+    )
+
+async def capturar_codigo_cc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Captura el código de 6 dígitos que el cliente escribe tras pulsar Camisetas/Pantalones.
+    Si no se estaba esperando ningún código (fuera de ese flujo), no hace nada."""
+    clave = context.user_data.get("cc_esperando_codigo")
+    if not clave:
+        return
+
+    codigo = update.message.text.strip()
+    if not (codigo.isdigit() and len(codigo) == 6):
+        await update.message.reply_text(
+            "❌ El código debe tener exactamente 6 dígitos. Vuelve a escribirlo.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")]])
+        )
+        return  # se mantiene la espera para que pueda reintentar
+
     db = load_db()
+    nombre_defecto, precio, stock_file = ROPA[clave]
     nombre = get_subetiqueta(db, "cc", clave, nombre_defecto)
+    cantidad = contar_stock_por_codigo(stock_file, codigo)
+
+    if cantidad <= 0:
+        await update.message.reply_text(
+            f"❌ El ID *{codigo}* no está disponible.\nPrueba con otro código.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")]])
+        )
+        return  # se mantiene la espera para que pueda reintentar con otro código
+
+    context.user_data.pop("cc_esperando_codigo", None)
+    await update.message.reply_text(
+        f"✅ *{nombre}* — código *{codigo}*\n\nHay *{cantidad}* unidad(es) en stock.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛒 Comprar", callback_data=f"cccomprar_{clave}_{codigo}")],
+            [InlineKeyboardButton("🔙 Menú principal", callback_data="menu_principal")],
+        ])
+    )
+
+async def cc_comprar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, clave, codigo = q.data.split("_")
+    db = load_db()
+    nombre_defecto, precio, stock_file = ROPA[clave]
+    nombre = get_subetiqueta(db, "cc", clave, nombre_defecto)
+
+    # Se revalida el stock por si otra persona ha comprado la última unidad justo antes.
+    if contar_stock_por_codigo(stock_file, codigo) <= 0:
+        await q.edit_message_text(
+            f"❌ El ID *{codigo}* ya no está disponible.",
+            parse_mode="Markdown",
+            reply_markup=volver_menu_keyboard()
+        )
+        return
+
     compra_id = crear_compra(
         db, q.from_user.id, q.from_user.username or q.from_user.first_name,
-        nombre, precio, auto_entrega=True, stock_file=stock_file
+        f"{nombre} (ID {codigo})", precio, auto_entrega=True, stock_file=stock_file, stock_codigo=codigo
     )
-    await iniciar_pago(q, context, compra_id, precio, nombre)
+    await iniciar_pago(q, context, compra_id, precio, f"{nombre} (ID {codigo})")
 
 # ─── CATEGORÍA: PANTALONES ──────────────────────────────────────────
 # 8 opciones numeradas, todas al mismo precio (da igual cuál se elija).
@@ -2127,6 +2226,8 @@ def texto_para_admin(numero, d):
     return f"""
 🔔 *PEDIDO #{numero}*
 
+👤 *Solicitado por:* @{d['username']} (ID `{d['usuario_id']}`)
+
 🏪 *Restaurante:* {d['restaurante_nombre']} ({d['comision_texto']})
 🍽️ *Pedido:* {d['pedido']}
 👤 *Nombre:* {d['nombre']}
@@ -2276,14 +2377,19 @@ def main():
                 CallbackQueryHandler(cancelar_conv_callback, pattern="^cancelar_conv$"),
             ],
         },
-        fallbacks=[CallbackQueryHandler(cancelar_conv_callback, pattern="^cancelar_conv$")],
+        fallbacks=[
+            CallbackQueryHandler(cancelar_conv_callback, pattern="^cancelar_conv$"),
+            CommandHandler("menu", cmd_menu),
+        ],
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(categoria_pedidos, pattern="^cat_pedidos$"))
     app.add_handler(CallbackQueryHandler(categoria_ropa, pattern="^cat_ropa$"))
     app.add_handler(CallbackQueryHandler(ver_producto_ropa, pattern="^ropa_"))
+    app.add_handler(CallbackQueryHandler(cc_comprar_callback, pattern="^cccomprar_"))
     app.add_handler(CallbackQueryHandler(categoria_pantalones, pattern="^cat_pantalones$"))
     app.add_handler(CallbackQueryHandler(ver_pantalon_numero, pattern="^pantalon_"))
     app.add_handler(CallbackQueryHandler(categoria_saldo, pattern="^cat_saldo$"))
@@ -2340,7 +2446,10 @@ def main():
     app.add_handler(CommandHandler("cola", cmd_cola))
     # Captura el hash de la transacción cripto cuando el usuario lo envía como texto suelto
     # (fuera de la conversación de pedido; solo actúa si hay una compra esperando ese hash).
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_hash_pago))
+    # Se registran en grupos distintos para que Telegram evalúe los DOS, no solo el primero
+    # que coincida (cada uno comprueba su propia bandera en user_data y no hace nada si no aplica).
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_codigo_cc), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_hash_pago), group=2)
 
     print("🛍️ Bot Zero Shop arrancado...")
     app.run_polling()
