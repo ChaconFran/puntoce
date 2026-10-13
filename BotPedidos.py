@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────
-BOT_TOKEN = "8997518264:AAFPKhQaqZfT83JPN-KOoLiowqq0-yQTjTs"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 # ID del grupo de administradores donde llegan los pedidos.
 GRUPO_ADMIN_ID = -1004416626509
@@ -34,7 +34,8 @@ CARPETA_BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", CARPETA_BASE)
 DB_FILE = os.environ.get("DB_PATH", os.path.join(DATA_DIR, "pedidos.json"))
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger("zero_shop")
 
 # ─── PLATAFORMAS / RESTAURANTES DISPONIBLES ───────────────────────
 # clave interna -> (texto a mostrar, precio fijo en €)
@@ -2685,8 +2686,26 @@ async def cmd_cola(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lineas = [f"#{n} — {p['nombre']} ({p.get('restaurante_nombre','?')}) — {ESTADOS_PEDIDO[p['estado']]}" for n, p in activos]
     await update.message.reply_text("📋 *Cola actual:*\n\n" + "\n".join(lineas), parse_mode="Markdown")
 
+# ─── DIAGNÓSTICO Y CALLBACKS NO RECONOCIDOS ────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Registra excepciones de handlers con contexto suficiente para depurar Railway."""
+    logger.error("Excepción procesando update %r", update, exc_info=context.error)
+
+async def callback_no_reconocido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Evita que un botón sin handler deje el spinner girando indefinidamente."""
+    query = update.callback_query
+    if query is None:
+        return
+    logger.warning("Callback sin handler: data=%r user_id=%s", query.data, query.from_user.id)
+    try:
+        await query.answer("Este botón no está disponible. Abre /start y vuelve a intentarlo.", show_alert=True)
+    except Exception:
+        logger.exception("No se pudo responder al callback no reconocido")
+
 # ─── MAIN ─────────────────────────────────────────────────────────
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Falta la variable de entorno BOT_TOKEN. Configúrala en Railway > Variables.")
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -2809,6 +2828,9 @@ def main():
     app.add_handler(CallbackQueryHandler(ver_estado_callback, pattern="^ver_estado$"))
     app.add_handler(CallbackQueryHandler(volver_al_menu, pattern="^menu_principal$"))
     app.add_handler(CallbackQueryHandler(estado_callback, pattern="^estado_"))
+    # Debe ir después de todos los CallbackQueryHandler concretos: solo captura botones sin ruta.
+    app.add_handler(CallbackQueryHandler(callback_no_reconocido))
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("cola", cmd_cola))
     # Captura el hash de la transacción cripto cuando el usuario lo envía como texto suelto
     # (fuera de la conversación de pedido; solo actúa si hay una compra esperando ese hash).
